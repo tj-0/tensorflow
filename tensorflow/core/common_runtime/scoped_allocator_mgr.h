@@ -34,7 +34,7 @@ class ScopedAllocatorContainer : public core::RefCounted {
   Status AddScopedAllocator(
       const Tensor& backing_tensor, int32 scope_id, const string& scope_name,
       const gtl::ArraySlice<ScopedAllocator::Field>& fields,
-      int32 expected_call_count, ScopedAllocator** sa_ptr);
+      int32 expected_call_count);
 
   ScopedAllocatorInstance* GetInstance(int32 scope_id);
   ScopedAllocator* GetAllocator(int32 scope_id);
@@ -83,16 +83,19 @@ class ScopedAllocatorMgr {
       const Tensor& backing_tensor, int64 step_id, int32 scope_id,
       const string& scope_name,
       const gtl::ArraySlice<ScopedAllocator::Field>& fields,
-      int32 expected_call_count, ScopedAllocator** sa_ptr);
+      int32 expected_call_count);
 
   void Cleanup(int64 step_id);
 
   // Populate the bytes and offset members of Field.  Instance allocaters get
   // consecutive scope_id values following that of the base ScopedAllocator.
-  static void PopulateFields(int32 scope_id,
-                             const gtl::ArraySlice<TensorShape>& shapes,
-                             DataType dtype,
-                             std::vector<ScopedAllocator::Field>* fields);
+  // Returns the total number of bytes required to be allocated in the
+  // backing tensor, for convenience.  (The same value can be obtained
+  // by summing offset and bytes in the last field.)
+  static size_t PopulateFields(int32 scope_id,
+                               const gtl::ArraySlice<TensorShape>& shapes,
+                               const DataType dtype,
+                               std::vector<ScopedAllocator::Field>* fields);
 
   const string& device_name() const { return device_name_; }
 

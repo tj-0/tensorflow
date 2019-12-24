@@ -13,21 +13,23 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#ifndef TENSORFLOW_KERNELS_GATHER_FUNCTOR_H_
-#define TENSORFLOW_KERNELS_GATHER_FUNCTOR_H_
+#ifndef TENSORFLOW_CORE_KERNELS_GATHER_FUNCTOR_H_
+#define TENSORFLOW_CORE_KERNELS_GATHER_FUNCTOR_H_
 
 #include "third_party/eigen3/unsupported/Eigen/CXX11/Tensor"
 
+#include "tensorflow/core/framework/bounds_check.h"
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/tensor_types.h"
 #include "tensorflow/core/framework/type_traits.h"
-#include "tensorflow/core/kernels/bounds_check.h"
+#include "tensorflow/core/framework/variant.h"
 #include "tensorflow/core/platform/prefetch.h"
 #include "tensorflow/core/platform/types.h"
 #include "tensorflow/core/util/work_sharder.h"
 
 namespace tensorflow {
 typedef Eigen::ThreadPoolDevice CPUDevice;
+typedef Eigen::GpuDevice GPUDevice;
 
 namespace functor {
 
@@ -50,7 +52,7 @@ SliceIndex HandleCopies(OpKernelContext* ctx,
   }
   // Compute slice_bytes here so that static knowledge is available
   const size_t slice_bytes = slice_elems * sizeof(T);
-  auto worker_threads = ctx->device()->tensorflow_cpu_worker_threads();
+  auto* worker_threads = ctx->device()->tensorflow_cpu_worker_threads();
   mutex mu;
   // Store the value of invalidate index for printing error information, it's a
   // shared variable.
@@ -95,7 +97,8 @@ SliceIndex HandleCopies(OpKernelContext* ctx,
             slice_bytes);
       } else {
         // For non-"simple" types (e.g. strings).
-        out.template chip<1>(indices_idx) = params.template chip<1>(index);
+        out.template chip<0>(batch_idx).template chip<0>(indices_idx) =
+            params.template chip<0>(batch_idx).template chip<0>(index);
       }
       indices_idx = i_next;
       batch_idx = b_next;
@@ -113,13 +116,17 @@ struct GatherFunctorCPU {
                    typename TTypes<T, 3>::ConstTensor params,
                    typename TTypes<Index>::ConstFlat indices,
                    typename TTypes<T, 3>::Tensor out) {
-    const int64 N = indices.size();
+    const int64 indices_size = indices.size();
     const int64 slice_size = out.dimension(2);
     int64 bad_i;
 
+    const int64 batch_size = params.dimension(0);
+
     bool use_large = (slice_size > std::numeric_limits<int32>::max() ||
                       params.size() > std::numeric_limits<int32>::max() ||
-                      N > std::numeric_limits<int32>::max());
+                      indices_size > std::numeric_limits<int32>::max() ||
+                      batch_size * indices_size * slice_size >
+                          std::numeric_limits<int32>::max());
 #define CALL(elems)                                                      \
   do {                                                                   \
     if (use_large) {                                                     \
@@ -162,7 +169,17 @@ struct GatherFunctor<CPUDevice, T, Index> {
   }
 };
 
+template <typename Index>
+struct GatherFunctor<GPUDevice, Variant, Index> {
+  int64 operator()(OpKernelContext* ctx,
+                   typename TTypes<Variant, 3>::ConstTensor params,
+                   typename TTypes<Index>::ConstFlat indices,
+                   typename TTypes<Variant, 3>::Tensor out) {
+    return GatherFunctorCPU<Variant, Index>()(ctx, params, indices, out);
+  }
+};
+
 }  // namespace functor
 }  // namespace tensorflow
 
-#endif  // TENSORFLOW_KERNELS_GATHER_FUNCTOR_H_
+#endif  // TENSORFLOW_CORE_KERNELS_GATHER_FUNCTOR_H_

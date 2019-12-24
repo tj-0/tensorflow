@@ -13,10 +13,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include "tensorflow/compiler/tf2xla/kernels/conv_op_helpers.h"
 #include "tensorflow/compiler/tf2xla/type_util.h"
 #include "tensorflow/compiler/tf2xla/xla_helpers.h"
 #include "tensorflow/compiler/tf2xla/xla_op_kernel.h"
 #include "tensorflow/compiler/tf2xla/xla_op_registry.h"
+#include "tensorflow/compiler/xla/client/lib/constants.h"
+#include "tensorflow/compiler/xla/client/lib/matrix.h"
+#include "tensorflow/compiler/xla/client/xla_builder.h"
+#include "tensorflow/compiler/xla/shape_util.h"
+#include "tensorflow/compiler/xla/util.h"
+#include "tensorflow/core/framework/types.pb.h"
 #include "tensorflow/core/util/tensor_format.h"
 
 namespace tensorflow {
@@ -93,30 +100,27 @@ class ExtractImagePatchesOp : public XlaOpKernel {
                                 input_shape.DebugString()));
     const int64 depth = input_shape.dim_size(feature_dim);
 
-    xla::ComputationBuilder* builder = ctx->builder();
+    xla::XlaBuilder* builder = ctx->builder();
 
     // The following code is equivalent to:
     // eye = np.eye(kH * kW * D).reshape([kH, kW, D, kH * kW * kD])
     int64 kernel_size = 1;
-    std::vector<int64> lhs_shape(num_dims, 1);
+    std::vector<int64> kernel_shape(num_dims, 1);
     for (int i = 0; i < num_spatial_dims; ++i) {
       int input_dim = GetTensorSpatialDimIndex(num_dims, data_format, i);
-      lhs_shape[i] = ksizes_[input_dim];
+      kernel_shape[i] = ksizes_[input_dim];
       kernel_size *= ksizes_[input_dim];
     }
-    lhs_shape[num_spatial_dims] = depth;
-    lhs_shape[num_spatial_dims + 1] = 1;
-
-    // Builds an identity matrix as a broadcast equality of iotas.
-    // iota = np.arange(np.prod(ksize), depth)
-    // filter = np.equal(np.reshape(iota, [-1, 1]), iota).astype(np.float32)
-    xla::ComputationDataHandle iota;
-    TF_CHECK_OK(XlaHelpers::Iota(builder, DataType::DT_INT32,
-                                 kernel_size * depth, &iota));
-
-    auto lhs = builder->Reshape(iota, lhs_shape);
-    auto filter = builder->ConvertElementType(
-        builder->Eq(lhs, iota, {num_spatial_dims + 1}), type);
+    kernel_shape[num_spatial_dims] = 1;
+    kernel_shape[num_spatial_dims + 1] = kernel_size * depth;
+    xla::Shape iota_kernel_shape =
+        xla::ShapeUtil::MakeShape(xla::S32, {kernel_size, depth, kernel_size});
+    xla::XlaOp filter =
+        xla::Reshape(xla::ConvertElementType(
+                         xla::Eq(xla::Iota(builder, iota_kernel_shape, 0),
+                                 xla::Iota(builder, iota_kernel_shape, 2)),
+                         type),
+                     kernel_shape);
 
     xla::ConvolutionDimensionNumbers dims;
     std::vector<int64> window_strides(num_spatial_dims);
@@ -147,9 +151,19 @@ class ExtractImagePatchesOp : public XlaOpKernel {
                    &padding[i].first, &padding[i].second));
     }
 
-    xla::ComputationDataHandle conv =
-        builder->ConvGeneralDilated(ctx->Input(0), filter, window_strides,
-                                    padding, lhs_dilation, rhs_dilation, dims);
+    xla::XlaOp conv =
+        xla::ConvGeneralDilated(ctx->Input(0), filter, window_strides, padding,
+                                lhs_dilation, rhs_dilation, dims, depth);
+    // Feature group convolution, will end up with the kernel_size change more
+    // rapidly than the depth. Reshape, transpose and reshape to reorder them.
+    std::vector<int64> conv_dims =
+        xla::SpanToVector(builder->GetShape(conv).ValueOrDie().dimensions());
+    conv_dims.back() = depth;
+    conv_dims.push_back(kernel_size);
+    conv = xla::TransposeInMinorDims(xla::Reshape(conv, conv_dims));
+    conv_dims.pop_back();
+    conv_dims.back() *= kernel_size;
+    conv = xla::Reshape(conv, conv_dims);
     ctx->SetOutput(0, conv);
   }
 
@@ -163,7 +177,11 @@ class ExtractImagePatchesOp : public XlaOpKernel {
   TF_DISALLOW_COPY_AND_ASSIGN(ExtractImagePatchesOp);
 };
 
-REGISTER_XLA_OP(Name("ExtractImagePatches"), ExtractImagePatchesOp);
+// We don't support integers for the convolution used in the implementation of
+// this op, so we limit the supported types.
+REGISTER_XLA_OP(
+    Name("ExtractImagePatches").TypeConstraint("T", GetXlaConvTypes()),
+    ExtractImagePatchesOp);
 
 }  // namespace
 }  // namespace tensorflow

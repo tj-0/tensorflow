@@ -19,14 +19,15 @@ limitations under the License.
 #include <string>
 #include <unordered_map>
 #include <vector>
+
 #include <curl/curl.h>
-#include "tensorflow/core/lib/core/errors.h"
-#include "tensorflow/core/lib/core/status.h"
-#include "tensorflow/core/lib/core/stringpiece.h"
 #include "tensorflow/core/platform/cloud/http_request.h"
 #include "tensorflow/core/platform/env.h"
+#include "tensorflow/core/platform/errors.h"
 #include "tensorflow/core/platform/macros.h"
 #include "tensorflow/core/platform/protobuf.h"
+#include "tensorflow/core/platform/status.h"
+#include "tensorflow/core/platform/stringpiece.h"
 #include "tensorflow/core/platform/types.h"
 
 namespace tensorflow {
@@ -167,6 +168,10 @@ class CurlHttpRequest : public HttpRequest {
   void CheckNotSent() const;
   StringPiece GetResponse() const;
 
+  /// Helper to convert the given CURLcode and error buffer, representing the
+  /// result of performing a transfer, into a Status with an error message.
+  Status CURLcodeToStatus(CURLcode code, const char* error_buffer);
+
   LibCurl* libcurl_;
   Env* env_;
 
@@ -181,6 +186,7 @@ class CurlHttpRequest : public HttpRequest {
     char* buffer_;
     size_t buffer_size_;
     size_t bytes_transferred_;
+    size_t bytes_received_;
   };
   DirectResponseState direct_response_ = {};
 
@@ -219,7 +225,7 @@ class CurlHttpRequest : public HttpRequest {
   string uri_;
   RequestMethod method_ = RequestMethod::kGet;
 
-  // Limit the size of a http response that is copied into an error message.
+  // Limit the size of an http response that is copied into an error message.
   const size_t response_to_error_limit_ = 500;
 
   TF_DISALLOW_COPY_AND_ASSIGN(CurlHttpRequest);
@@ -261,20 +267,7 @@ class LibCurl {
   virtual void curl_slist_free_all(curl_slist* list) = 0;
   virtual char* curl_easy_escape(CURL* curl, const char* str, int length) = 0;
   virtual void curl_free(void* p) = 0;
-
-  virtual const char* curl_easy_strerror(CURLcode errornum) = 0;
 };
-
-Status CURLcodeToStatus(CURLcode code);
-
-#define TF_CURL_RETURN_WITH_CONTEXT_IF_ERROR(_code, ...)                    \
-  do {                                                                      \
-    if (_code != CURLE_OK) {                                                \
-      ::tensorflow::Status _status = ::tensorflow::CURLcodeToStatus(_code); \
-      ::tensorflow::errors::AppendToMessage(&_status, __VA_ARGS__);         \
-      return _status;                                                       \
-    }                                                                       \
-  } while (0)
 
 }  // namespace tensorflow
 

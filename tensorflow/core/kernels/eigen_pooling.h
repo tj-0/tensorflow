@@ -274,7 +274,8 @@ namespace internal {
 
 template <typename T>
 struct AvgPoolMeanReducer {
-#if (EIGEN_ARCH_i386 || EIGEN_ARCH_x86_64) && !defined(__CUDACC__)
+#if (EIGEN_ARCH_i386 || EIGEN_ARCH_x86_64) && !defined(__CUDACC__) && \
+    !defined(__HIPCC__)
   // We only support packet access for floats.
   static const bool PacketAccess = internal::is_same<T, float>::value;
 #else
@@ -303,7 +304,8 @@ struct AvgPoolMeanReducer {
     return accum / T(scalarCount_);
   }
 
-#if (EIGEN_ARCH_i386 || EIGEN_ARCH_x86_64) && !defined(__CUDACC__)
+#if (EIGEN_ARCH_i386 || EIGEN_ARCH_x86_64) && !defined(__CUDACC__) && \
+    !defined(__HIPCC__)
 #ifdef EIGEN_VECTORIZE_AVX512
 #define pequal(a, b)   \
   _mm512_castsi512_ps( \
@@ -334,7 +336,8 @@ struct AvgPoolMeanReducer {
   }
 
   template <typename Packet>
-  void reducePacketWithType(T, const Packet& p, Packet* accum) {
+  EIGEN_DEVICE_FUNC EIGEN_STRONG_INLINE void reducePacketWithType(
+      T, const Packet& p, Packet* accum) {
     Packet skip_mask =
         pequal(p, pset1<Packet>(-Eigen::NumTraits<T>::highest()));
     (*accum) = padd<Packet>(*accum, psel(p, pset1<Packet>(0), skip_mask));
@@ -369,18 +372,26 @@ template <typename Device>
 struct reducer_traits<AvgPoolMeanReducer<float>, Device> {
   enum {
     Cost = 1,
-#if (EIGEN_ARCH_i386 || EIGEN_ARCH_x86_64) && !defined(__CUDACC__)
+#if (EIGEN_ARCH_i386 || EIGEN_ARCH_x86_64) && !defined(__CUDACC__) && \
+    !defined(__HIPCC__)
     // We only support packet access for floats.
-    PacketAccess = true
+    PacketAccess = true,
 #else
-    PacketAccess = false
+    PacketAccess = false,
 #endif
+    IsStateful = true,
+    IsExactlyAssociative = false
   };
 };
 
 template <>
 struct reducer_traits<AvgPoolMeanReducer<float>, GpuDevice> {
-  enum { Cost = 1, PacketAccess = false };
+  enum {
+    Cost = 1,
+    PacketAccess = false,
+    IsStateful = true,
+    IsExactlyAssociative = false
+  };
 };
 
 }  // namespace internal
@@ -480,11 +491,9 @@ SpatialAvgPooling(const Input& input, DenseIndex patchRows,
                              Eigen::type2index<3> > >::type reduction_dims;
 #endif
   return input
-      .extract_image_patches(
-          patchRows, patchCols, strideRows, strideCols, in_strideRows,
-          in_strideCols, padding_type,
-          -Eigen::NumTraits<typename internal::remove_const<
-              typename internal::traits<Input>::Scalar>::type>::highest())
+      .extract_image_patches(patchRows, patchCols, strideRows, strideCols,
+                             in_strideRows, in_strideCols, padding_type,
+                             -Eigen::NumTraits<CoeffReturnType>::highest())
       .reduce(reduction_dims, mean_with_nan)
       .reshape(post_reduce_dims);
 }

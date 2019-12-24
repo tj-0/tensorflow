@@ -32,8 +32,12 @@ static const char* kTestOptimizerName = "Test";
 
 class TestGraphOptimizer : public CustomGraphOptimizer {
  public:
-  Status Init() override { return Status::OK(); }
+  Status Init(const tensorflow::RewriterConfig_CustomGraphOptimizer* config =
+                  nullptr) override {
+    return Status::OK();
+  }
   string name() const override { return kTestOptimizerName; }
+  bool UsesFunctionLibrary() const override { return false; }
   Status Optimize(Cluster* cluster, const GrapplerItem& item,
                   GraphDef* optimized_graph) override {
     return Status::OK();

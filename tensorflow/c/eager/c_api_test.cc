@@ -16,6 +16,11 @@ limitations under the License.
 #include "tensorflow/c/eager/c_api.h"
 
 #include <string.h>
+
+#include "absl/strings/match.h"
+#include "tensorflow/c/eager/c_api_experimental.h"
+#include "tensorflow/c/eager/c_api_internal.h"
+#include "tensorflow/c/eager/c_api_test_util.h"
 #include "tensorflow/core/framework/function.pb.h"
 #include "tensorflow/core/lib/strings/strcat.h"
 #include "tensorflow/core/platform/logging.h"
@@ -23,127 +28,13 @@ limitations under the License.
 #include "tensorflow/core/platform/protobuf.h"
 #include "tensorflow/core/platform/test.h"
 #include "tensorflow/core/platform/test_benchmark.h"
+#include "tensorflow/core/protobuf/cluster.pb.h"
 #include "tensorflow/core/protobuf/config.pb.h"
+#include "tensorflow/core/protobuf/tensorflow_server.pb.h"
 
 using tensorflow::string;
 
 namespace {
-
-TFE_TensorHandle* DoubleTestMatrixTensorHandle() {
-  int64_t dims[] = {2, 2};
-  double data[] = {1.0, 2.0, 3.0, 4.0};
-  TF_Tensor* t = TF_AllocateTensor(
-      TF_DOUBLE, &dims[0], sizeof(dims) / sizeof(int64_t), sizeof(data));
-  memcpy(TF_TensorData(t), &data[0], TF_TensorByteSize(t));
-  TF_Status* status = TF_NewStatus();
-  TFE_TensorHandle* th = TFE_NewTensorHandle(t, status);
-  CHECK_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
-  TF_DeleteTensor(t);
-  TF_DeleteStatus(status);
-  return th;
-}
-
-TFE_TensorHandle* TestMatrixTensorHandle() {
-  int64_t dims[] = {2, 2};
-  float data[] = {1.0f, 2.0f, 3.0f, 4.0f};
-  TF_Tensor* t = TF_AllocateTensor(
-      TF_FLOAT, &dims[0], sizeof(dims) / sizeof(int64_t), sizeof(data));
-  memcpy(TF_TensorData(t), &data[0], TF_TensorByteSize(t));
-  TF_Status* status = TF_NewStatus();
-  TFE_TensorHandle* th = TFE_NewTensorHandle(t, status);
-  CHECK_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
-  TF_DeleteTensor(t);
-  TF_DeleteStatus(status);
-  return th;
-}
-
-TFE_TensorHandle* TestMatrixTensorHandle3X2() {
-  int64_t dims[] = {3, 2};
-  double data[] = {1.0, 2.0, 3.0, 4.0, 5.0, 6.0};
-  TF_Tensor* t = TF_AllocateTensor(
-      TF_FLOAT, &dims[0], sizeof(dims) / sizeof(int64_t), sizeof(data));
-  memcpy(TF_TensorData(t), &data[0], TF_TensorByteSize(t));
-  TF_Status* status = TF_NewStatus();
-  TFE_TensorHandle* th = TFE_NewTensorHandle(t, status);
-  CHECK_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
-  TF_DeleteTensor(t);
-  TF_DeleteStatus(status);
-  return th;
-}
-
-TFE_Op* MatMulOp(TFE_Context* ctx, TFE_TensorHandle* a, TFE_TensorHandle* b) {
-  TF_Status* status = TF_NewStatus();
-
-  TFE_Op* op = TFE_NewOp(ctx, "MatMul", status);
-  CHECK_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
-  TFE_OpAddInput(op, a, status);
-  CHECK_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
-  TFE_OpAddInput(op, b, status);
-  CHECK_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
-  TF_DeleteStatus(status);
-  TFE_OpSetAttrBool(op, "transpose_a", 0);
-  TFE_OpSetAttrBool(op, "transpose_b", 0);
-  TFE_OpSetAttrType(op, "T", TFE_TensorHandleDataType(a));
-
-  return op;
-}
-
-TFE_TensorHandle* TestAxisTensorHandle() {
-  int64_t dims[] = {1};
-  int data[] = {1};
-  TF_Tensor* t = TF_AllocateTensor(
-      TF_INT32, &dims[0], sizeof(dims) / sizeof(int64_t), sizeof(data));
-  memcpy(TF_TensorData(t), &data[0], TF_TensorByteSize(t));
-  TF_Status* status = TF_NewStatus();
-  TFE_TensorHandle* th = TFE_NewTensorHandle(t, status);
-  CHECK_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
-  TF_DeleteTensor(t);
-  TF_DeleteStatus(status);
-  return th;
-}
-
-TFE_Op* MinOp(TFE_Context* ctx, TFE_TensorHandle* input,
-              TFE_TensorHandle* axis) {
-  TF_Status* status = TF_NewStatus();
-
-  TFE_Op* op = TFE_NewOp(ctx, "Min", status);
-  CHECK_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
-  TFE_OpAddInput(op, input, status);
-  CHECK_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
-  TFE_OpAddInput(op, axis, status);
-  CHECK_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
-  TFE_OpSetAttrBool(op, "keep_dims", 1);
-  TFE_OpSetAttrType(op, "Tidx", TF_INT32);
-  TF_DeleteStatus(status);
-  TFE_OpSetAttrType(op, "T", TFE_TensorHandleDataType(input));
-
-  return op;
-}
-
-// If there is a GPU device, returns true and sets 'gpu_device_name'
-// accordingly.
-bool GetGPUDeviceName(TFE_Context* ctx, string* gpu_device_name) {
-  std::unique_ptr<TF_Status, decltype(&TF_DeleteStatus)> status(
-      TF_NewStatus(), TF_DeleteStatus);
-  TF_DeviceList* devices = TFE_ContextListDevices(ctx, status.get());
-  CHECK_EQ(TF_OK, TF_GetCode(status.get())) << TF_Message(status.get());
-
-  const int num_devices = TF_DeviceListCount(devices);
-  for (int i = 0; i < num_devices; ++i) {
-    const string device_type(TF_DeviceListType(devices, i, status.get()));
-    CHECK_EQ(TF_GetCode(status.get()), TF_OK) << TF_Message(status.get());
-    const string device_name(TF_DeviceListName(devices, i, status.get()));
-    CHECK_EQ(TF_GetCode(status.get()), TF_OK) << TF_Message(status.get());
-    if (device_type == "GPU") {
-      *gpu_device_name = device_name;
-      LOG(INFO) << "Found GPU device " << device_name;
-      TF_DeleteDeviceList(devices);
-      return true;
-    }
-  }
-  TF_DeleteDeviceList(devices);
-  return false;
-}
 
 void BM_InitOp(int iters) {
   tensorflow::testing::StopTiming();
@@ -161,7 +52,7 @@ void BM_InitOp(int iters) {
   }
   tensorflow::testing::StopTiming();
   TFE_DeleteTensorHandle(m);
-  TFE_DeleteContext(ctx, status);
+  TFE_DeleteContext(ctx);
   CHECK_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
   TF_DeleteStatus(status);
 }
@@ -187,16 +78,54 @@ void BM_Execute(int iters, int async) {
     CHECK_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
   }
   if (async) {
-    TFE_ContextAsyncWait(ctx, status);
+    TFE_Executor* executor = TFE_ContextGetExecutorForThread(ctx);
+    TFE_ExecutorWaitForAllPendingNodes(executor, status);
+    ASSERT_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
+    TFE_DeleteExecutor(executor);
   }
   tensorflow::testing::StopTiming();
   TFE_DeleteOp(matmul);
   TFE_DeleteTensorHandle(m);
-  TFE_DeleteContext(ctx, status);
+  TFE_DeleteContext(ctx);
   CHECK_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
   TF_DeleteStatus(status);
 }
 BENCHMARK(BM_Execute)->Arg(0)->Arg(1);
+
+void BM_Execute_Identity(int iters, int async) {
+  tensorflow::testing::StopTiming();
+  tensorflow::testing::SetLabel(async ? "ExecuteIdentityAsync"
+                                      : "ExecuteIdentity");
+  TF_Status* status = TF_NewStatus();
+  TFE_ContextOptions* opts = TFE_NewContextOptions();
+  TFE_ContextOptionsSetAsync(opts, static_cast<unsigned char>(async));
+  TFE_Context* ctx = TFE_NewContext(opts, status);
+  CHECK_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
+  TFE_DeleteContextOptions(opts);
+
+  TFE_TensorHandle* m = TestMatrixTensorHandle();
+  TFE_Op* identity = IdentityOp(ctx, m);
+  TFE_TensorHandle* retvals[1];
+  int num_retvals = 1;
+  tensorflow::testing::StartTiming();
+  for (int i = 0; i < iters; ++i) {
+    TFE_Execute(identity, &retvals[0], &num_retvals, status);
+    CHECK_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
+  }
+  if (async) {
+    TFE_Executor* executor = TFE_ContextGetExecutorForThread(ctx);
+    TFE_ExecutorWaitForAllPendingNodes(executor, status);
+    ASSERT_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
+    TFE_DeleteExecutor(executor);
+  }
+  tensorflow::testing::StopTiming();
+  TFE_DeleteOp(identity);
+  TFE_DeleteTensorHandle(m);
+  TFE_DeleteContext(ctx);
+  CHECK_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
+  TF_DeleteStatus(status);
+}
+BENCHMARK(BM_Execute_Identity)->Arg(0)->Arg(1);
 
 TEST(CAPI, Context) {
   TF_Status* status = TF_NewStatus();
@@ -207,7 +136,7 @@ TEST(CAPI, Context) {
   TF_DeviceList* devices = TFE_ContextListDevices(ctx, status);
   EXPECT_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
 
-  TFE_DeleteContext(ctx, status);
+  TFE_DeleteContext(ctx);
   EXPECT_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
 
   const int num_devices = TF_DeviceListCount(devices);
@@ -304,8 +233,7 @@ void TensorHandleCopyBetweenDevices(bool async) {
   TF_DeleteDeviceList(devices);
   TF_DeleteTensor(t);
   TFE_DeleteTensorHandle(hcpu);
-  TFE_DeleteContext(ctx, status.get());
-  EXPECT_EQ(TF_OK, TF_GetCode(status.get())) << TF_Message(status.get());
+  TFE_DeleteContext(ctx);
 }
 
 TEST(CAPI, TensorHandleCopyBetweenDevices) {
@@ -337,12 +265,15 @@ void TensorHandleCopyBetweenDevicesError(bool async) {
   TFE_TensorHandle* hcopy =
       TFE_TensorHandleCopyToDevice(hcpu, ctx, kCPUDevice, status.get());
   EXPECT_EQ(TF_OK, TF_GetCode(status.get())) << TF_Message(status.get());
-  TFE_ContextAsyncWait(ctx, status.get());
-  EXPECT_EQ(TF_OK, TF_GetCode(status.get()));
+
+  TFE_Executor* executor = TFE_ContextGetExecutorForThread(ctx);
+  TFE_ExecutorWaitForAllPendingNodes(executor, status.get());
+  EXPECT_EQ(TF_OK, TF_GetCode(status.get())) << TF_Message(status.get());
+  TFE_DeleteExecutor(executor);
   TFE_DeleteTensorHandle(hcopy);
   TFE_DeleteTensorHandle(hcpu);
   if (hdevice != nullptr) TFE_DeleteTensorHandle(hdevice);
-  TFE_DeleteContext(ctx, status.get());
+  TFE_DeleteContext(ctx);
 }
 
 TEST(CAPI, TensorHandleCopyBetweenDevicesError) {
@@ -369,13 +300,26 @@ void TensorHandleCopyBetweenTwoGPUDevices(bool async) {
   TF_DeviceList* devices = TFE_ContextListDevices(ctx, status.get());
   ASSERT_EQ(TF_OK, TF_GetCode(status.get())) << TF_Message(status.get());
   const int num_devices = TF_DeviceListCount(devices);
+  bool has_gpu0 = false;
+  bool has_gpu1 = false;
+  for (int i = 0; i < num_devices; ++i) {
+    const char* dev = TF_DeviceListName(devices, i, status.get());
+    ASSERT_EQ(TF_OK, TF_GetCode(status.get())) << TF_Message(status.get());
+    string device_name(dev);
+    if (device_name.find("GPU:0") != string::npos) {
+      has_gpu0 = true;
+    }
+    if (device_name.find("GPU:1") != string::npos) {
+      has_gpu1 = true;
+    }
+  }
 
   const char* kCPUDevice = "CPU:0";
-  if (num_devices < 3) {
+  if (!has_gpu0 || !has_gpu1) {
     TF_DeleteDeviceList(devices);
     TF_DeleteTensor(t);
     TFE_DeleteTensorHandle(hcpu);
-    TFE_DeleteContext(ctx, status.get());
+    TFE_DeleteContext(ctx);
     return;
   }
   const string gpu_1_name(TF_DeviceListName(devices, 1, status.get()));
@@ -408,8 +352,7 @@ void TensorHandleCopyBetweenTwoGPUDevices(bool async) {
   TF_DeleteDeviceList(devices);
   TF_DeleteTensor(t);
   TFE_DeleteTensorHandle(hcpu);
-  TFE_DeleteContext(ctx, status.get());
-  EXPECT_EQ(TF_OK, TF_GetCode(status.get())) << TF_Message(status.get());
+  TFE_DeleteContext(ctx);
 }
 
 TEST(CAPI, TensorHandleCopyBetweenTwoGPUDevices) {
@@ -436,7 +379,7 @@ void TensorHandleSilentCopy(bool async) {
 
   // Disable the test if no GPU is present.
   string gpu_device_name;
-  if (GetGPUDeviceName(ctx, &gpu_device_name)) {
+  if (GetDeviceName(ctx, &gpu_device_name, "GPU")) {
     TFE_TensorHandle* hgpu = TFE_TensorHandleCopyToDevice(
         hcpu, ctx, gpu_device_name.c_str(), status.get());
     ASSERT_TRUE(TF_GetCode(status.get()) == TF_OK) << TF_Message(status.get());
@@ -455,10 +398,11 @@ void TensorHandleSilentCopy(bool async) {
 
   TF_DeleteTensor(t);
   TFE_DeleteTensorHandle(hcpu);
-  TFE_ContextAsyncWait(ctx, status.get());
-  EXPECT_EQ(TF_OK, TF_GetCode(status.get())) << TF_Message(status.get());
-  TFE_DeleteContext(ctx, status.get());
-  EXPECT_EQ(TF_OK, TF_GetCode(status.get())) << TF_Message(status.get());
+  TFE_Executor* executor = TFE_ContextGetExecutorForThread(ctx);
+  TFE_ExecutorWaitForAllPendingNodes(executor, status.get());
+  ASSERT_EQ(TF_OK, TF_GetCode(status.get())) << TF_Message(status.get());
+  TFE_DeleteExecutor(executor);
+  TFE_DeleteContext(ctx);
 }
 
 TEST(CAPI, TensorHandleSilentCopy) { TensorHandleSilentCopy(false); }
@@ -483,7 +427,7 @@ void TensorHandleSilentCopyLocal(bool async) {
 
   // Disable the test if no GPU is present.
   string gpu_device_name;
-  if (GetGPUDeviceName(ctx, &gpu_device_name)) {
+  if (GetDeviceName(ctx, &gpu_device_name, "GPU")) {
     TFE_TensorHandle* hgpu = TFE_TensorHandleCopyToDevice(
         hcpu, ctx, gpu_device_name.c_str(), status.get());
     ASSERT_TRUE(TF_GetCode(status.get()) == TF_OK) << TF_Message(status.get());
@@ -502,10 +446,11 @@ void TensorHandleSilentCopyLocal(bool async) {
 
   TF_DeleteTensor(t);
   TFE_DeleteTensorHandle(hcpu);
-  TFE_ContextAsyncWait(ctx, status.get());
-  EXPECT_EQ(TF_OK, TF_GetCode(status.get())) << TF_Message(status.get());
-  TFE_DeleteContext(ctx, status.get());
-  EXPECT_EQ(TF_OK, TF_GetCode(status.get())) << TF_Message(status.get());
+  TFE_Executor* executor = TFE_ContextGetExecutorForThread(ctx);
+  TFE_ExecutorWaitForAllPendingNodes(executor, status.get());
+  ASSERT_EQ(TF_OK, TF_GetCode(status.get())) << TF_Message(status.get());
+  TFE_DeleteExecutor(executor);
+  TFE_DeleteContext(ctx);
 }
 TEST(CAPI, TensorHandleSilentCopyLocal) { TensorHandleSilentCopyLocal(false); }
 TEST(CAPI, TensorHandleSilentCopyLocalAsync) {
@@ -524,7 +469,7 @@ void SetAndGetOpDevices(bool async) {
 
   // Disable the test if no GPU is present.
   string gpu_device_name;
-  if (GetGPUDeviceName(ctx, &gpu_device_name)) {
+  if (GetDeviceName(ctx, &gpu_device_name, "GPU")) {
     TFE_OpSetDevice(matmul, "GPU:0", status);
     ASSERT_TRUE(TF_GetCode(status) == TF_OK) << TF_Message(status);
     const char* device_name = TFE_OpGetDevice(matmul, status);
@@ -538,9 +483,111 @@ void SetAndGetOpDevices(bool async) {
 
   TFE_DeleteOp(matmul);
   TFE_DeleteTensorHandle(m);
-  TFE_DeleteContext(ctx, status);
+  TFE_DeleteContext(ctx);
   ASSERT_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
   TF_DeleteStatus(status);
+}
+
+TEST(CAPI, TensorHandleNullptr) {
+  TFE_TensorHandle* h = nullptr;
+  std::unique_ptr<TF_Status, decltype(&TF_DeleteStatus)> status(
+      TF_NewStatus(), TF_DeleteStatus);
+
+  TF_Tensor* t = TFE_TensorHandleResolve(h, status.get());
+  ASSERT_EQ(TF_INVALID_ARGUMENT, TF_GetCode(status.get()));
+  ASSERT_EQ(t, nullptr);
+  ASSERT_EQ("The passed in handle is a nullptr",
+            string(TF_Message(status.get())));
+
+  TF_SetStatus(status.get(), TF_OK, "");
+
+  const char* device_name = TFE_TensorHandleDeviceName(h, status.get());
+  ASSERT_EQ(TF_INVALID_ARGUMENT, TF_GetCode(status.get()));
+  ASSERT_EQ(device_name, nullptr);
+  ASSERT_EQ("The passed in handle is a nullptr",
+            string(TF_Message(status.get())));
+
+  TF_SetStatus(status.get(), TF_OK, "");
+
+  device_name = TFE_TensorHandleBackingDeviceName(h, status.get());
+  ASSERT_EQ(TF_INVALID_ARGUMENT, TF_GetCode(status.get()));
+  ASSERT_EQ(device_name, nullptr);
+  ASSERT_EQ("The passed in handle is a nullptr",
+            string(TF_Message(status.get())));
+
+  TF_SetStatus(status.get(), TF_OK, "");
+
+  int num_dims = TFE_TensorHandleNumDims(h, status.get());
+  ASSERT_EQ(TF_INVALID_ARGUMENT, TF_GetCode(status.get()));
+  ASSERT_EQ(num_dims, -1);
+  ASSERT_EQ("The passed in handle is a nullptr",
+            string(TF_Message(status.get())));
+
+  TF_SetStatus(status.get(), TF_OK, "");
+
+  int dim = TFE_TensorHandleDim(h, 0, status.get());
+  ASSERT_EQ(TF_INVALID_ARGUMENT, TF_GetCode(status.get()));
+  ASSERT_EQ(dim, -1);
+  ASSERT_EQ("The passed in handle is a nullptr",
+            string(TF_Message(status.get())));
+}
+
+TEST(CAPI, TensorHandleDevices) {
+  std::unique_ptr<TF_Status, decltype(&TF_DeleteStatus)> status(
+      TF_NewStatus(), TF_DeleteStatus);
+  TFE_ContextOptions* opts = TFE_NewContextOptions();
+  TFE_Context* ctx = TFE_NewContext(opts, status.get());
+  TFE_DeleteContextOptions(opts);
+  ASSERT_EQ(TF_OK, TF_GetCode(status.get())) << TF_Message(status.get());
+
+  TFE_TensorHandle* hcpu = TestMatrixTensorHandle();
+  const char* device_name = TFE_TensorHandleDeviceName(hcpu, status.get());
+  ASSERT_EQ(TF_OK, TF_GetCode(status.get())) << TF_Message(status.get());
+  ASSERT_TRUE(absl::StrContains(device_name, "CPU:0")) << device_name;
+  const char* backing_device_name =
+      TFE_TensorHandleBackingDeviceName(hcpu, status.get());
+  ASSERT_EQ(TF_OK, TF_GetCode(status.get())) << TF_Message(status.get());
+  ASSERT_TRUE(absl::StrContains(backing_device_name, "CPU:0"))
+      << backing_device_name;
+
+  // Disable the test if no GPU is present.
+  string gpu_device_name;
+  if (GetDeviceName(ctx, &gpu_device_name, "GPU")) {
+    TFE_TensorHandle* hgpu = TFE_TensorHandleCopyToDevice(
+        hcpu, ctx, gpu_device_name.c_str(), status.get());
+    ASSERT_TRUE(TF_GetCode(status.get()) == TF_OK) << TF_Message(status.get());
+
+    TFE_Op* shape_op = ShapeOp(ctx, hgpu);
+    TFE_OpSetDevice(shape_op, gpu_device_name.c_str(), status.get());
+    ASSERT_TRUE(TF_GetCode(status.get()) == TF_OK) << TF_Message(status.get());
+    TFE_TensorHandle* retvals[1];
+    int num_retvals = 1;
+    TFE_Execute(shape_op, &retvals[0], &num_retvals, status.get());
+    ASSERT_TRUE(TF_GetCode(status.get()) == TF_OK) << TF_Message(status.get());
+
+    // .device of shape is GPU since the op is executed on GPU
+    device_name = TFE_TensorHandleDeviceName(retvals[0], status.get());
+    ASSERT_EQ(TF_OK, TF_GetCode(status.get())) << TF_Message(status.get());
+    ASSERT_TRUE(absl::StrContains(device_name, "GPU:0")) << device_name;
+
+    // .backing_device of shape is CPU since the tensor is backed by CPU
+    backing_device_name =
+        TFE_TensorHandleBackingDeviceName(retvals[0], status.get());
+    ASSERT_EQ(TF_OK, TF_GetCode(status.get())) << TF_Message(status.get());
+    ASSERT_TRUE(absl::StrContains(backing_device_name, "CPU:0"))
+        << backing_device_name;
+
+    TFE_DeleteOp(shape_op);
+    TFE_DeleteTensorHandle(retvals[0]);
+    TFE_DeleteTensorHandle(hgpu);
+  }
+
+  TFE_DeleteTensorHandle(hcpu);
+  TFE_Executor* executor = TFE_ContextGetExecutorForThread(ctx);
+  TFE_ExecutorWaitForAllPendingNodes(executor, status.get());
+  ASSERT_EQ(TF_OK, TF_GetCode(status.get())) << TF_Message(status.get());
+  TFE_DeleteExecutor(executor);
+  TFE_DeleteContext(ctx);
 }
 
 void Execute_MatMul_CPU(bool async) {
@@ -564,7 +611,7 @@ void Execute_MatMul_CPU(bool async) {
   TF_Tensor* t = TFE_TensorHandleResolve(retvals[0], status);
   ASSERT_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
   TFE_DeleteTensorHandle(retvals[0]);
-  TFE_DeleteContext(ctx, status);
+  TFE_DeleteContext(ctx);
   ASSERT_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
   float product[4] = {0};
   EXPECT_EQ(sizeof(product), TF_TensorByteSize(t));
@@ -588,9 +635,15 @@ void Execute_MatMul_CPU_Runtime_Error(bool async) {
   TFE_DeleteContextOptions(opts);
 
   TFE_TensorHandle* m1 = TestMatrixTensorHandle();
-  TFE_TensorHandle* m2 = TestMatrixTensorHandle3X2();
+  TFE_TensorHandle* m2 = DoubleTestMatrixTensorHandle3X2();
   TFE_Op* matmul = MatMulOp(ctx, m1, m2);
+  TFE_OpSetDevice(matmul, "/job:localhost/replica:0/task:0/device:CPU:0",
+                  status);
+  ASSERT_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
   TFE_Op* matmul2 = MatMulOp(ctx, m1, m1);
+  TFE_OpSetDevice(matmul2, "/job:localhost/replica:0/task:0/device:CPU:0",
+                  status);
+  ASSERT_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
   TFE_TensorHandle* retvals[1] = {nullptr};
   int num_retvals = 1;
   TFE_Execute(matmul, &retvals[0], &num_retvals, status);
@@ -608,12 +661,17 @@ void Execute_MatMul_CPU_Runtime_Error(bool async) {
     // still fail.
     TF_SetStatus(status, TF_OK, "");
     TFE_DeleteTensorHandle(retvals[0]);
+    TFE_Executor* executor = TFE_ContextGetExecutorForThread(ctx);
+    TFE_ExecutorWaitForAllPendingNodes(executor, status);
+    EXPECT_NE(TF_OK, TF_GetCode(status));
+    TF_SetStatus(status, TF_OK, "");
     retvals[0] = nullptr;
     TFE_Execute(matmul2, &retvals[0], &num_retvals, status);
     EXPECT_NE(TF_OK, TF_GetCode(status));
-    TFE_ContextAsyncClearError(ctx);
-    TFE_ContextAsyncWait(ctx, status);
-    EXPECT_EQ(TF_OK, TF_GetCode(status));
+    TFE_ExecutorClearError(executor);
+    TFE_ExecutorWaitForAllPendingNodes(executor, status);
+    ASSERT_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
+    TFE_DeleteExecutor(executor);
   }
   // Following works in async mode since TFE_ContextAsyncClearError was called.
   TF_SetStatus(status, TF_OK, "");
@@ -630,7 +688,7 @@ void Execute_MatMul_CPU_Runtime_Error(bool async) {
   TFE_DeleteTensorHandle(m1);
   TFE_DeleteTensorHandle(m2);
   TFE_DeleteTensorHandle(retvals[0]);
-  TFE_DeleteContext(ctx, status);
+  TFE_DeleteContext(ctx);
   TF_DeleteStatus(status);
 }
 TEST(CAPI, Execute_MatMul_CPU_Runtime_Error) {
@@ -661,7 +719,7 @@ void Execute_MatMul_CPU_Type_Error(bool async) {
   if (retvals[0] != nullptr) {
     TFE_DeleteTensorHandle(retvals[0]);
   }
-  TFE_DeleteContext(ctx, status);
+  TFE_DeleteContext(ctx);
   TF_DeleteStatus(status);
 }
 
@@ -688,19 +746,19 @@ TEST(CAPI, Execute_Min_CPU) {
   TFE_DeleteOp(minOp);
   TFE_DeleteTensorHandle(input);
   TFE_DeleteTensorHandle(axis);
-  TFE_DeleteContext(ctx, status);
-  ASSERT_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
   ASSERT_EQ(1, num_retvals);
 
   TF_Tensor* t = TFE_TensorHandleResolve(retvals[0], status);
-  TFE_DeleteTensorHandle(retvals[0]);
   ASSERT_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
+  TFE_DeleteTensorHandle(retvals[0]);
   float output[2] = {0};
   EXPECT_EQ(sizeof(output), TF_TensorByteSize(t));
   memcpy(&output[0], TF_TensorData(t), TF_TensorByteSize(t));
   TF_DeleteTensor(t);
   EXPECT_EQ(1, output[0]);
   EXPECT_EQ(3, output[1]);
+  TFE_DeleteContext(ctx);
+  ASSERT_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
   TF_DeleteStatus(status);
 }
 
@@ -741,7 +799,7 @@ void Execute_MatMul_XLA_CPU(bool async) {
   EXPECT_EQ(10, product[1]);
   EXPECT_EQ(15, product[2]);
   EXPECT_EQ(22, product[3]);
-  TFE_DeleteContext(ctx, status);
+  TFE_DeleteContext(ctx);
   TF_DeleteStatus(status);
 }
 TEST(CAPI, Execute_MatMul_XLA_CPU) { Execute_MatMul_XLA_CPU(false); }
@@ -780,7 +838,7 @@ void Execute_Min_XLA_CPU(bool async) {
   TF_DeleteTensor(t);
   EXPECT_EQ(1, output[0]);
   EXPECT_EQ(3, output[1]);
-  TFE_DeleteContext(ctx, status);
+  TFE_DeleteContext(ctx);
   TF_DeleteStatus(status);
 }
 TEST(CAPI, Execute_Min_XLA_CPU) { Execute_Min_XLA_CPU(false); }
@@ -816,7 +874,7 @@ void ExecuteWithTracing(bool async) {
 
   TF_Tensor* t = TFE_TensorHandleResolve(retvals[0], status);
   TFE_DeleteTensorHandle(retvals[0]);
-  TFE_DeleteContext(ctx, status);
+  TFE_DeleteContext(ctx);
   ASSERT_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
   float product[4] = {0};
   EXPECT_EQ(sizeof(product), TF_TensorByteSize(t));
@@ -830,143 +888,6 @@ void ExecuteWithTracing(bool async) {
 }
 TEST(CAPI, ExecuteWithTracing) { ExecuteWithTracing(false); }
 TEST(CAPI, ExecuteWithTracingAsync) { ExecuteWithTracing(true); }
-
-TEST(CAPI, Function_ident_CPU) {
-  // First create a simple identity function.
-  TF_Graph* function_graph = TF_NewGraph();
-  TF_OperationDescription* arg_descr =
-      TF_NewOperation(function_graph, "Placeholder", "arg");
-  TF_SetAttrType(arg_descr, "dtype", TF_INT32);
-  TF_Status* status = TF_NewStatus();
-  TF_Operation* arg = TF_FinishOperation(arg_descr, status);
-  ASSERT_TRUE(TF_GetCode(status) == TF_OK) << TF_Message(status);
-  TF_OperationDescription* id_descr =
-      TF_NewOperation(function_graph, "Identity", "id");
-  TF_SetAttrType(id_descr, "T", TF_INT32);
-  TF_AddInput(id_descr, {arg, 0});
-  TF_Operation* id = TF_FinishOperation(id_descr, status);
-  ASSERT_TRUE(TF_GetCode(status) == TF_OK) << TF_Message(status);
-  TF_Output input{arg, 0};
-  TF_Output output{id, 0};
-  TF_Function* fn =
-      TF_GraphToFunction(function_graph, "ident", 0, 1, &id, 1, &input, 1,
-                         &output, nullptr, nullptr, "test", status);
-  ASSERT_TRUE(TF_GetCode(status) == TF_OK) << TF_Message(status);
-  TF_DeleteGraph(function_graph);
-  TFE_ContextOptions* opts = TFE_NewContextOptions();
-  TFE_Context* ctx = TFE_NewContext(opts, status);
-  ASSERT_TRUE(TF_GetCode(status) == TF_OK) << TF_Message(status);
-  TFE_DeleteContextOptions(opts);
-  TFE_ContextAddFunction(ctx, fn, status);
-  ASSERT_TRUE(TF_GetCode(status) == TF_OK) << TF_Message(status);
-  TF_DeleteFunction(fn);
-
-  for (bool async : {false, true, false}) {
-    TFE_ContextSetAsyncForThread(ctx, static_cast<unsigned char>(async),
-                                 status);
-    ASSERT_TRUE(TF_GetCode(status) == TF_OK);
-    TF_Tensor* t =
-        TF_AllocateTensor(TF_INT32, nullptr, 0, 1 * sizeof(tensorflow::int32));
-    *reinterpret_cast<tensorflow::int32*>(TF_TensorData(t)) = 42;
-    TFE_TensorHandle* h = TFE_NewTensorHandle(t, status);
-    ASSERT_TRUE(TF_GetCode(status) == TF_OK) << TF_Message(status);
-    TF_DeleteTensor(t);
-
-    TFE_Op* op = TFE_NewOp(ctx, "ident", status);
-    ASSERT_TRUE(TF_GetCode(status) == TF_OK) << TF_Message(status);
-    TFE_OpAddInput(op, h, status);
-    ASSERT_TRUE(TF_GetCode(status) == TF_OK) << TF_Message(status);
-
-    std::vector<TFE_TensorHandle*> result;
-    result.push_back(nullptr);
-    int num_retvals = 1;
-    TFE_Execute(op, result.data(), &num_retvals, status);
-    TFE_DeleteOp(op);
-    ASSERT_TRUE(TF_GetCode(status) == TF_OK) << TF_Message(status);
-    ASSERT_EQ(num_retvals, 1);
-
-    TF_Tensor* r = TFE_TensorHandleResolve(result[0], status);
-    ASSERT_TRUE(TF_GetCode(status) == TF_OK) << TF_Message(status);
-    EXPECT_EQ(*reinterpret_cast<tensorflow::int32*>(TF_TensorData(r)), 42);
-    TFE_DeleteTensorHandle(h);
-    TF_DeleteTensor(r);
-    TFE_DeleteTensorHandle(result[0]);
-  }
-  TFE_DeleteContext(ctx, status);
-  ASSERT_TRUE(TF_GetCode(status) == TF_OK) << TF_Message(status);
-  TF_DeleteStatus(status);
-}
-
-#ifdef TENSORFLOW_EAGER_USE_XLA
-TEST(CAPI, Function_ident_XLA_CPU) {
-  // First create a simple identity function.
-  TF_Graph* function_graph = TF_NewGraph();
-  TF_OperationDescription* arg_descr =
-      TF_NewOperation(function_graph, "Placeholder", "arg");
-  TF_SetAttrType(arg_descr, "dtype", TF_INT32);
-  TF_Status* status = TF_NewStatus();
-  TF_Operation* arg = TF_FinishOperation(arg_descr, status);
-  ASSERT_TRUE(TF_GetCode(status) == TF_OK) << TF_Message(status);
-  TF_OperationDescription* id_descr =
-      TF_NewOperation(function_graph, "Identity", "id");
-  TF_SetAttrType(id_descr, "T", TF_INT32);
-  TF_AddInput(id_descr, {arg, 0});
-  TF_Operation* id = TF_FinishOperation(id_descr, status);
-  ASSERT_TRUE(TF_GetCode(status) == TF_OK) << TF_Message(status);
-  TF_Output input{arg, 0};
-  TF_Output output{id, 0};
-  TF_Function* fn =
-      TF_GraphToFunction(function_graph, "ident", 0, 1, &id, 1, &input, 1,
-                         &output, nullptr, nullptr, "test", status);
-  ASSERT_TRUE(TF_GetCode(status) == TF_OK) << TF_Message(status);
-  TF_DeleteGraph(function_graph);
-  TFE_ContextOptions* opts = TFE_NewContextOptions();
-  TFE_Context* ctx = TFE_NewContext(opts, status);
-  ASSERT_TRUE(TF_GetCode(status) == TF_OK) << TF_Message(status);
-  TFE_DeleteContextOptions(opts);
-  TFE_ContextAddFunction(ctx, fn, status);
-  ASSERT_TRUE(TF_GetCode(status) == TF_OK) << TF_Message(status);
-  TF_DeleteFunction(fn);
-
-  for (bool async : {false, true, false}) {
-    TFE_ContextSetAsyncForThread(ctx, static_cast<unsigned char>(async),
-                                 status);
-    ASSERT_TRUE(TF_GetCode(status) == TF_OK);
-    TF_Tensor* t =
-        TF_AllocateTensor(TF_INT32, nullptr, 0, 1 * sizeof(tensorflow::int32));
-    *reinterpret_cast<tensorflow::int32*>(TF_TensorData(t)) = 42;
-    TFE_TensorHandle* h = TFE_NewTensorHandle(t, status);
-    ASSERT_TRUE(TF_GetCode(status) == TF_OK) << TF_Message(status);
-    TF_DeleteTensor(t);
-
-    TFE_Op* op = TFE_NewOp(ctx, "ident", status);
-    ASSERT_TRUE(TF_GetCode(status) == TF_OK) << TF_Message(status);
-    TFE_OpAddInput(op, h, status);
-    ASSERT_TRUE(TF_GetCode(status) == TF_OK) << TF_Message(status);
-
-    // Now run it via XLA.
-    TFE_OpSetXLACompilation(op, true);
-
-    std::vector<TFE_TensorHandle*> result;
-    result.push_back(nullptr);
-    int num_retvals = 1;
-    TFE_Execute(op, result.data(), &num_retvals, status);
-    TFE_DeleteOp(op);
-    ASSERT_TRUE(TF_GetCode(status) == TF_OK) << TF_Message(status);
-    ASSERT_EQ(num_retvals, 1);
-
-    TF_Tensor* r = TFE_TensorHandleResolve(result[0], status);
-    ASSERT_TRUE(TF_GetCode(status) == TF_OK) << TF_Message(status);
-    EXPECT_EQ(*reinterpret_cast<tensorflow::int32*>(TF_TensorData(r)), 42);
-    TFE_DeleteTensorHandle(h);
-    TF_DeleteTensor(r);
-    TFE_DeleteTensorHandle(result[0]);
-  }
-  TFE_DeleteContext(ctx, status);
-  ASSERT_TRUE(TF_GetCode(status) == TF_OK) << TF_Message(status);
-  TF_DeleteStatus(status);
-}
-#endif  // TENSORFLOW_EAGER_USE_XLA
 
 string MatMulFunction() {
   tensorflow::FunctionDef def;
@@ -1015,30 +936,37 @@ void FunctionDefAndExecute(bool async) {
                             status);
   CHECK_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
 
-  TFE_TensorHandle* m = TestMatrixTensorHandle();
-  TFE_TensorHandle* retval[1] = {nullptr};
-  int num_retvals = 1;
-  TFE_Op* op = TFE_NewOp(ctx, "MatMulFunction", status);
-  ASSERT_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
-  TFE_OpAddInput(op, m, status);
-  ASSERT_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
-  TFE_Execute(op, &retval[0], &num_retvals, status);
-  ASSERT_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
-  ASSERT_EQ(1, num_retvals);
-  TFE_DeleteOp(op);
-  TFE_DeleteTensorHandle(m);
-  TF_Tensor* t = TFE_TensorHandleResolve(retval[0], status);
-  TFE_DeleteTensorHandle(retval[0]);
-  ASSERT_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
-  float product[4] = {0};
-  EXPECT_EQ(sizeof(product), TF_TensorByteSize(t));
-  memcpy(&product[0], TF_TensorData(t), TF_TensorByteSize(t));
-  TF_DeleteTensor(t);
-  EXPECT_EQ(7, product[0]);
-  EXPECT_EQ(10, product[1]);
-  EXPECT_EQ(15, product[2]);
-  EXPECT_EQ(22, product[3]);
-  TFE_DeleteContext(ctx, status);
+  for (bool clear_cache : {true, false, true}) {
+    if (clear_cache) {
+      TFE_ContextClearCaches(ctx);
+    }
+    TFE_TensorHandle* m = TestMatrixTensorHandle();
+    TFE_TensorHandle* retval[1] = {nullptr};
+    int num_retvals = 1;
+    TFE_Op* op = TFE_NewOp(ctx, "MatMulFunction", status);
+    ASSERT_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
+    TFE_OpAddInput(op, m, status);
+    ASSERT_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
+    TFE_Execute(op, &retval[0], &num_retvals, status);
+    ASSERT_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
+    ASSERT_EQ(1, num_retvals);
+    TFE_DeleteOp(op);
+    TFE_DeleteTensorHandle(m);
+    TF_Tensor* t = TFE_TensorHandleResolve(retval[0], status);
+    TFE_DeleteTensorHandle(retval[0]);
+    ASSERT_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
+    float product[4] = {0};
+    EXPECT_EQ(sizeof(product), TF_TensorByteSize(t));
+    memcpy(&product[0], TF_TensorData(t), TF_TensorByteSize(t));
+    TF_DeleteTensor(t);
+    EXPECT_EQ(7, product[0]);
+    EXPECT_EQ(10, product[1]);
+    EXPECT_EQ(15, product[2]);
+    EXPECT_EQ(22, product[3]);
+  }
+  TFE_ContextRemoveFunction(ctx, "MatMulFunction", status);
+  ASSERT_TRUE(TF_GetCode(status) == TF_OK) << TF_Message(status);
+  TFE_DeleteContext(ctx);
   EXPECT_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
   TF_DeleteStatus(status);
 }
@@ -1074,12 +1002,17 @@ void BM_ExecuteFunction(int iters, int async) {
     CHECK_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
   }
   if (async) {
-    TFE_ContextAsyncWait(ctx, status);
+    TFE_Executor* executor = TFE_ContextGetExecutorForThread(ctx);
+    TFE_ExecutorWaitForAllPendingNodes(executor, status);
+    ASSERT_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
+    TFE_DeleteExecutor(executor);
   }
   tensorflow::testing::StopTiming();
   TFE_DeleteTensorHandle(m);
   TFE_DeleteTensorHandle(retval[0]);
-  TFE_DeleteContext(ctx, status);
+  TFE_ContextRemoveFunction(ctx, "MatMulFunction", status);
+  ASSERT_TRUE(TF_GetCode(status) == TF_OK) << TF_Message(status);
+  TFE_DeleteContext(ctx);
   EXPECT_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
   TF_DeleteStatus(status);
 }
@@ -1092,8 +1025,8 @@ TFE_TensorHandle* CreateVariable(TFE_Context* ctx, float value,
   if (TF_GetCode(status) != TF_OK) return nullptr;
   TFE_OpSetAttrType(op, "dtype", TF_FLOAT);
   TFE_OpSetAttrShape(op, "shape", {}, 0, status);
-  TFE_OpSetAttrString(op, "container", "");
-  TFE_OpSetAttrString(op, "shared_name", "");
+  TFE_OpSetAttrString(op, "container", "", 0);
+  TFE_OpSetAttrString(op, "shared_name", "", 0);
   if (TF_GetCode(status) != TF_OK) return nullptr;
   TFE_TensorHandle* var_handle = nullptr;
   int num_retvals = 1;
@@ -1167,7 +1100,7 @@ TEST(CAPI, Variables) {
 
   TFE_DeleteTensorHandle(var_handle);
   TFE_DeleteTensorHandle(value_handle);
-  TFE_DeleteContext(ctx, status);
+  TFE_DeleteContext(ctx);
   CHECK_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
   TF_DeleteStatus(status);
 }
@@ -1206,10 +1139,322 @@ void BM_ReadVariable(int iters) {
   TFE_DeleteOp(op);
 
   TFE_DeleteTensorHandle(var_handle);
-  TFE_DeleteContext(ctx, status);
+  TFE_DeleteContext(ctx);
   CHECK_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
   TF_DeleteStatus(status);
 }
 BENCHMARK(BM_ReadVariable);
+
+TEST(CAPI, StringAttributes) {
+  // Test that TFE_OpSetAttrString doesn't hold on to the value after it
+  // returns.
+  TF_Status* status = TF_NewStatus();
+  TFE_ContextOptions* opts = TFE_NewContextOptions();
+  TFE_Context* ctx = TFE_NewContext(opts, status);
+  ASSERT_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
+  TFE_DeleteContextOptions(opts);
+
+  std::vector<int64_t> dims(4, 1);
+  TFE_Op* op = TFE_NewOp(ctx, "AvgPool", status);
+  ASSERT_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
+
+  TF_Tensor* tensor =
+      TF_AllocateTensor(TF_FLOAT, dims.data(), dims.size(), sizeof(float));
+  float tensor_data[] = {1};
+  memcpy(TF_TensorData(tensor), tensor_data, TF_TensorByteSize(tensor));
+  TFE_TensorHandle* tensor_handle = TFE_NewTensorHandle(tensor, status);
+  ASSERT_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
+  TFE_OpAddInput(op, tensor_handle, status);
+  TF_DeleteTensor(tensor);
+  TFE_DeleteTensorHandle(tensor_handle);
+
+  std::vector<int64_t> values(4, 1);
+  TFE_OpSetAttrIntList(op, "ksize", values.data(), values.size());
+  TFE_OpSetAttrIntList(op, "strides", values.data(), values.size());
+
+  const int BUFFER_SIZE = 10;
+  char buffer[BUFFER_SIZE];
+  std::strncpy(buffer, "VALID", BUFFER_SIZE);
+  TFE_OpSetAttrString(op, "padding", buffer, std::strlen(buffer));
+  // Overwriting value in "buffer", should be fine since TFE_Op
+  // shouldn't be holding on to it.
+  std::strncpy(buffer, "NHWC", BUFFER_SIZE);
+  TFE_OpSetAttrString(op, "data_format", buffer, std::strlen(buffer));
+
+  TFE_OpSetAttrType(op, "T", TF_FLOAT);
+
+  ASSERT_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
+
+  TFE_TensorHandle* retvals[1];
+  int num_retvals = 1;
+  TFE_Execute(op, &retvals[0], &num_retvals, status);
+  ASSERT_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
+  ASSERT_EQ(1, num_retvals);
+
+  tensor = TFE_TensorHandleResolve(retvals[0], status);
+  ASSERT_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
+  EXPECT_EQ(4, TF_TensorByteSize(tensor));
+  TF_DeleteTensor(tensor);
+  TFE_DeleteTensorHandle(retvals[0]);
+
+  TFE_DeleteOp(op);
+
+  TFE_DeleteContext(ctx);
+  TF_DeleteStatus(status);
+}
+
+TEST(CAPI, TestTFE_TensorHandleCopySharingUnderlyingTensorHandle) {
+  TFE_TensorHandle* h = TestMatrixTensorHandle();
+  EXPECT_EQ(TF_FLOAT, TFE_TensorHandleDataType(h));
+
+  std::unique_ptr<TF_Status, decltype(&TF_DeleteStatus)> status(
+      TF_NewStatus(), TF_DeleteStatus);
+
+  TFE_TensorHandle* h_shares_tensor =
+      TFE_TensorHandleCopySharingTensor(h, status.get());
+  ASSERT_EQ(TF_OK, TF_GetCode(status.get())) << TF_Message(status.get());
+
+  TF_Tensor* t = TFE_TensorHandleResolve(h_shares_tensor, status.get());
+  ASSERT_EQ(16, TF_TensorByteSize(t));
+  float data[4] = {0};
+  memcpy(&data[0], TF_TensorData(t), TF_TensorByteSize(t));
+  EXPECT_EQ(1.0, data[0]);
+  EXPECT_EQ(2.0, data[1]);
+  EXPECT_EQ(3.0, data[2]);
+  EXPECT_EQ(4.0, data[3]);
+  TF_DeleteTensor(t);
+
+  TFE_DeleteTensorHandle(h);
+  TFE_DeleteTensorHandle(h_shares_tensor);
+}
+
+TEST(CAPI, TestTFE_OpInferSingleInputAttrs) {
+  TF_Status* status = TF_NewStatus();
+  TFE_ContextOptions* opts = TFE_NewContextOptions();
+  TFE_Context* ctx = TFE_NewContext(opts, status);
+  CHECK_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
+  TFE_DeleteContextOptions(opts);
+
+  TFE_TensorHandle* input = TestMatrixTensorHandle();
+  TFE_TensorHandle* axis = TestAxisTensorHandle();
+  TFE_Op* minOp = TFE_NewOp(ctx, "Min", status);
+  CHECK_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
+  TFE_OpAddInput(minOp, input, status);
+  CHECK_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
+  TFE_OpAddInput(minOp, axis, status);
+  CHECK_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
+
+  tensorflow::AttrValueMap attr_values;
+  minOp->operation.Attrs().FillAttrValueMap(&attr_values);
+  tensorflow::AttrValueMap::const_iterator attr_found = attr_values.find("T");
+  EXPECT_NE(attr_found, attr_values.cend());
+  EXPECT_EQ(attr_found->second.type(), tensorflow::DataType::DT_FLOAT);
+  attr_found = attr_values.find("Tidx");
+  EXPECT_NE(attr_found, attr_values.cend());
+  EXPECT_EQ(attr_found->second.type(), tensorflow::DataType::DT_INT32);
+
+  TFE_TensorHandle* retvals[1] = {nullptr};
+  int num_retvals = 1;
+  TFE_Execute(minOp, &retvals[0], &num_retvals, status);
+  EXPECT_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
+
+  TF_DeleteStatus(status);
+  TFE_DeleteOp(minOp);
+  TFE_DeleteTensorHandle(input);
+  TFE_DeleteTensorHandle(axis);
+  TFE_DeleteTensorHandle(retvals[0]);
+  TFE_DeleteContext(ctx);
+}
+
+TEST(CAPI, TestTFE_OpInferSingleTypeInputListAttrs) {
+  TF_Status* status = TF_NewStatus();
+  TFE_ContextOptions* opts = TFE_NewContextOptions();
+  TFE_Context* ctx = TFE_NewContext(opts, status);
+  CHECK_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
+  TFE_DeleteContextOptions(opts);
+
+  TFE_TensorHandle* input1 = TestMatrixTensorHandle();
+  TFE_TensorHandle* input2 = TestMatrixTensorHandle();
+  TFE_TensorHandle* dim = TestScalarTensorHandle(0);
+  TFE_Op* concatOp = TFE_NewOp(ctx, "Concat", status);
+  CHECK_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
+  TFE_TensorHandle* inputs[] = {input1, input2};
+  TFE_OpAddInput(concatOp, dim, status);
+  CHECK_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
+  TFE_OpAddInputList(concatOp, inputs, 2, status);
+  CHECK_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
+
+  tensorflow::AttrValueMap attr_values;
+  concatOp->operation.Attrs().FillAttrValueMap(&attr_values);
+  tensorflow::AttrValueMap::const_iterator attr_found = attr_values.find("T");
+  EXPECT_NE(attr_found, attr_values.cend());
+  EXPECT_EQ(attr_found->second.type(), tensorflow::DataType::DT_FLOAT);
+  attr_found = attr_values.find("N");
+  EXPECT_NE(attr_found, attr_values.cend());
+  EXPECT_EQ(attr_found->second.i(), 2);
+
+  TFE_TensorHandle* retvals[1] = {nullptr};
+  int num_retvals = 1;
+  TFE_Execute(concatOp, &retvals[0], &num_retvals, status);
+  EXPECT_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
+
+  TF_DeleteStatus(status);
+  TFE_DeleteOp(concatOp);
+  TFE_DeleteTensorHandle(input1);
+  TFE_DeleteTensorHandle(input2);
+  TFE_DeleteTensorHandle(retvals[0]);
+  TFE_DeleteTensorHandle(dim);
+  TFE_DeleteContext(ctx);
+}
+
+TEST(CAPI, TestTFE_OpInferMixedTypeInputListAttrs) {
+  TF_Status* status = TF_NewStatus();
+  TFE_ContextOptions* opts = TFE_NewContextOptions();
+  TFE_Context* ctx = TFE_NewContext(opts, status);
+  CHECK_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
+  TFE_DeleteContextOptions(opts);
+
+  TFE_TensorHandle* condition = TestScalarTensorHandle(true);
+  TFE_TensorHandle* t1 = TestMatrixTensorHandle();
+  TFE_TensorHandle* t2 = TestAxisTensorHandle();
+  TFE_Op* assertOp = TFE_NewOp(ctx, "Assert", status);
+  CHECK_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
+  TFE_OpAddInput(assertOp, condition, status);
+  CHECK_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
+  TFE_TensorHandle* data[] = {condition, t1, t2};
+  TFE_OpAddInputList(assertOp, data, 3, status);
+  CHECK_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
+
+  tensorflow::AttrValueMap attr_values;
+  assertOp->operation.Attrs().FillAttrValueMap(&attr_values);
+  tensorflow::AttrValueMap::const_iterator attr_found = attr_values.find("T");
+  EXPECT_NE(attr_found, attr_values.cend());
+  EXPECT_EQ(attr_found->second.list().type(0), tensorflow::DataType::DT_BOOL);
+  EXPECT_EQ(attr_found->second.list().type(1), tensorflow::DataType::DT_FLOAT);
+  EXPECT_EQ(attr_found->second.list().type(2), tensorflow::DataType::DT_INT32);
+
+  TFE_TensorHandle* retvals[1] = {nullptr};
+  int num_retvals = 1;
+  TFE_Execute(assertOp, &retvals[0], &num_retvals, status);
+  EXPECT_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
+
+  TF_DeleteStatus(status);
+  TFE_DeleteOp(assertOp);
+  TFE_DeleteTensorHandle(condition);
+  TFE_DeleteTensorHandle(t1);
+  TFE_DeleteTensorHandle(t2);
+  TFE_DeleteTensorHandle(retvals[0]);
+  TFE_DeleteContext(ctx);
+}
+
+TEST(CAPI, TestTFE_OpAttrsInferenceDisabledWhenNotCallingOpAddInputList) {
+  TF_Status* status = TF_NewStatus();
+  TFE_ContextOptions* opts = TFE_NewContextOptions();
+  TFE_Context* ctx = TFE_NewContext(opts, status);
+  CHECK_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
+  TFE_DeleteContextOptions(opts);
+
+  TFE_TensorHandle* input1 = TestMatrixTensorHandle();
+  TFE_TensorHandle* input2 = TestMatrixTensorHandle();
+  TFE_TensorHandle* dim = TestScalarTensorHandle(0);
+  TFE_Op* concatOp = TFE_NewOp(ctx, "Concat", status);
+  CHECK_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
+  TFE_TensorHandle* inputs[] = {input1, input2};
+  TFE_OpAddInput(concatOp, dim, status);
+  CHECK_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
+  CHECK(concatOp->inference_ctx);
+  TFE_OpAddInput(concatOp, inputs[0], status);
+  CHECK_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
+  EXPECT_FALSE(concatOp->inference_ctx) << "Inference context is still present";
+  TFE_OpAddInput(concatOp, inputs[1], status);
+  CHECK_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
+
+  tensorflow::AttrValueMap attr_values;
+  concatOp->operation.Attrs().FillAttrValueMap(&attr_values);
+  EXPECT_EQ(attr_values.find("T"), attr_values.end());
+  EXPECT_EQ(attr_values.find("N"), attr_values.end());
+
+  TF_DeleteStatus(status);
+  TFE_DeleteOp(concatOp);
+  TFE_DeleteTensorHandle(input1);
+  TFE_DeleteTensorHandle(input2);
+  TFE_DeleteTensorHandle(dim);
+  TFE_DeleteContext(ctx);
+}
+
+TEST(CAPI, TestTFE_OpGetInputAndOutputLengths) {
+  TF_Status* status = TF_NewStatus();
+  TFE_ContextOptions* opts = TFE_NewContextOptions();
+  TFE_Context* ctx = TFE_NewContext(opts, status);
+  CHECK_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
+  TFE_DeleteContextOptions(opts);
+
+  TFE_TensorHandle* input1 = TestMatrixTensorHandle();
+  TFE_TensorHandle* input2 = TestMatrixTensorHandle();
+  TFE_Op* identityOp = TFE_NewOp(ctx, "IdentityN", status);
+  CHECK_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
+
+  // Try to retrieve lengths before building the attributes (should fail)
+  EXPECT_EQ(-1, TFE_OpGetInputLength(identityOp, "input", status));
+  CHECK_NE(TF_OK, TF_GetCode(status)) << TF_Message(status);
+  EXPECT_EQ(-1, TFE_OpGetOutputLength(identityOp, "output", status));
+  CHECK_NE(TF_OK, TF_GetCode(status)) << TF_Message(status);
+
+  TFE_TensorHandle* inputs[] = {input1, input2};
+  TFE_OpAddInputList(identityOp, inputs, 2, status);
+  CHECK_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
+
+  // Try to retrieve lengths before executing the op (should work)
+  EXPECT_EQ(2, TFE_OpGetInputLength(identityOp, "input", status));
+  CHECK_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
+  EXPECT_EQ(2, TFE_OpGetOutputLength(identityOp, "output", status));
+  CHECK_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
+
+  TFE_TensorHandle* retvals[2] = {nullptr};
+  int num_retvals = 2;
+  TFE_Execute(identityOp, &retvals[0], &num_retvals, status);
+  EXPECT_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
+
+  // Try to retrieve lengths after executing the op (should work)
+  EXPECT_EQ(2, TFE_OpGetInputLength(identityOp, "input", status));
+  CHECK_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
+  EXPECT_EQ(2, TFE_OpGetOutputLength(identityOp, "output", status));
+  CHECK_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
+
+  TF_DeleteStatus(status);
+  TFE_DeleteOp(identityOp);
+  TFE_DeleteTensorHandle(input1);
+  TFE_DeleteTensorHandle(input2);
+  TFE_DeleteTensorHandle(retvals[0]);
+  TFE_DeleteTensorHandle(retvals[1]);
+  TFE_DeleteContext(ctx);
+}
+
+TEST(CAPI, TestTFE_OpGetInputAndOutputLengthsFailForUnknownArguments) {
+  TF_Status* status = TF_NewStatus();
+  TFE_ContextOptions* opts = TFE_NewContextOptions();
+  TFE_Context* ctx = TFE_NewContext(opts, status);
+  CHECK_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
+  TFE_DeleteContextOptions(opts);
+
+  TFE_TensorHandle* input1 = TestMatrixTensorHandle();
+  TFE_TensorHandle* input2 = TestMatrixTensorHandle();
+  TFE_Op* identityOp = TFE_NewOp(ctx, "IdentityN", status);
+  CHECK_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
+  TFE_TensorHandle* inputs[] = {input1, input2};
+  TFE_OpAddInputList(identityOp, inputs, 2, status);
+  CHECK_EQ(TF_OK, TF_GetCode(status)) << TF_Message(status);
+
+  EXPECT_EQ(-1, TFE_OpGetInputLength(identityOp, "cheese", status));
+  CHECK_EQ(TF_INVALID_ARGUMENT, TF_GetCode(status)) << TF_Message(status);
+  EXPECT_EQ(-1, TFE_OpGetOutputLength(identityOp, "cheese", status));
+  CHECK_EQ(TF_INVALID_ARGUMENT, TF_GetCode(status)) << TF_Message(status);
+
+  TF_DeleteStatus(status);
+  TFE_DeleteOp(identityOp);
+  TFE_DeleteTensorHandle(input1);
+  TFE_DeleteTensorHandle(input2);
+  TFE_DeleteContext(ctx);
+}
 
 }  // namespace

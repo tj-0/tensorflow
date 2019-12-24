@@ -13,19 +13,15 @@
 # limitations under the License.
 # =============================================================================
 
-# pylint: disable=unused-import,g-bad-import-order
 """Contains layer utilies for input validation and format conversion.
 """
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-from tensorflow.python.eager import context
 from tensorflow.python.ops import variables
 from tensorflow.python.ops import control_flow_ops
-from tensorflow.python.framework import ops
 from tensorflow.python.framework import smart_cond as smart_module
-from tensorflow.python.framework import tensor_util
 from tensorflow.python.util import nest
 
 
@@ -235,7 +231,7 @@ def constant_value(pred):
 def object_list_uid(object_list):
   """Creates a single string from object ids."""
   object_list = nest.flatten(object_list)
-  return ', '.join([str(abs(id(x))) for x in object_list])
+  return ', '.join(str(abs(id(x))) for x in object_list)
 
 
 def static_shape(x):

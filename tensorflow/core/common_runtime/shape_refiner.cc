@@ -20,6 +20,8 @@ limitations under the License.
 #include <vector>
 
 #include "tensorflow/core/common_runtime/eval_const_tensor.h"
+#include "tensorflow/core/common_runtime/function.h"
+#include "tensorflow/core/framework/bounds_check.h"
 #include "tensorflow/core/framework/common_shape_fns.h"
 #include "tensorflow/core/framework/node_def.pb.h"
 #include "tensorflow/core/framework/tensor.h"
@@ -27,9 +29,7 @@ limitations under the License.
 #include "tensorflow/core/framework/versions.pb.h"
 #include "tensorflow/core/graph/algorithm.h"
 #include "tensorflow/core/graph/graph_constructor.h"
-#include "tensorflow/core/kernels/bounds_check.h"
 #include "tensorflow/core/lib/core/errors.h"
-#include "tensorflow/core/lib/gtl/stl_util.h"
 #include "tensorflow/core/public/session.h"
 
 namespace tensorflow {
@@ -82,7 +82,15 @@ Status InferShapesForFunctionSubNode(const Node* node, ShapeRefiner* refiner,
           " not in [0, ", outer_context->num_inputs(), ").");
     }
 
-    node_context->set_output(0, outer_context->input(index));
+    // TODO(b/134547156): TEMPORARY WORKAROUND. If input shape handle is not set
+    // in outer context, set _Arg node output shape to unknown.
+    if (outer_context->input(index).SameHandle(ShapeHandle())) {
+      LOG(WARNING) << "Function instantiation has undefined input shape at "
+                   << "index: " << index << " in the outer inference context.";
+      node_context->set_output(0, node_context->UnknownShape());
+    } else {
+      node_context->set_output(0, outer_context->input(index));
+    }
 
     auto* resource = outer_context->input_handle_shapes_and_types(index);
     if (resource) {
@@ -130,7 +138,7 @@ Status InferShapesForFunctionSubNode(const Node* node, ShapeRefiner* refiner,
 // Maybe we won't support recursive functions at all in TF, because of
 // other maintainability issues.
 Status ShapeRefiner::InferShapesForFunction(
-    const tensorflow::FunctionDef* function_def, bool keep_nested_shapes,
+    const FunctionDef* function_def, AttrSlice attributes,
     ExtendedInferenceContext* outer_context) {
   const Graph* graph;
   auto it = functions_.find(function_def);
@@ -139,7 +147,7 @@ Status ShapeRefiner::InferShapesForFunction(
   } else {
     InstantiationResult result;
     TF_RETURN_IF_ERROR(InstantiateFunction(
-        *function_def, outer_context->get_context()->attrs(),
+        *function_def, attributes,
         [this](const string& op, const OpDef** sig) {
           return this->function_library_->LookUpOpDef(op, sig);
         },
@@ -171,74 +179,51 @@ Status ShapeRefiner::InferShapesForFunction(
     ReverseDFS(*graph, {}, node_shape_inference_lambda);
   }
 
-  if (keep_nested_shapes && inference_status.ok()) {
-    // Fill the nested inferences map.
-    //
-    // The materialized function graph has extra nodes for arguments and
-    // return values, which are not explicitly listed in the FunctionDef,
-    // we filter out these special nodes here to not expose the implementation
-    // details and keep only inferences for the nodes listed in the FunctionDef.
-    std::unordered_map<string, const NodeDef*> user_defined_nodes;
-    for (const auto& node_def : function_def->node_def()) {
-      user_defined_nodes[node_def.name()] = &node_def;
-    }
-
-    std::unordered_map<string, std::unique_ptr<ExtendedInferenceContext>>
-        nested_inferences;
-    for (const Node* node : function_nodes) {
-      const string& node_name = node->name();
-      if (user_defined_nodes.find(node_name) != user_defined_nodes.end()) {
-        nested_inferences[node_name] = std::move(node_to_context_[node]);
-        node_to_context_.erase(node);
-        // By default InferenceContext refers to a NodeDef from Graph.
-        // Change it to the publicly accessible NodeDef of the function
-        // definition.
-        nested_inferences[node_name]->get_context()->node_def_ =
-            user_defined_nodes[node_name];
-      }
-    }
-    outer_context->set_nested_inferences(std::move(nested_inferences));
-  } else {
-    // Delete the contexts created for the functions nodes to save memory.
-    for (const Node* node : function_nodes) {
-      node_to_context_.erase(node);
-    }
+  // Delete the contexts created for the functions nodes to save memory.
+  for (const Node* node : function_nodes) {
+    node_to_context_.erase(node);
   }
 
   return inference_status;
 }
 
 Status ShapeRefiner::AddNode(const Node* node) {
+  // Create the inference context for this node with the existing input shapes.
+  std::unique_ptr<InferenceContext> ic(new InferenceContext(
+      graph_def_version_, node->def(), node->op_def(),
+      std::vector<ShapeHandle>(node->num_inputs()), {}, {}, {}));
+  TF_RETURN_IF_ERROR(ic->construction_status());
+
   // For each 'input' of this node, fetch the corresponding shape
-  // from 'input's InferenceContext, and store into a vector
-  // indexed by 'node's input.
-  std::vector<const Node*> input_nodes(node->num_inputs());
-  std::vector<ShapeHandle> input_shapes(node->num_inputs());
-  std::vector<std::unique_ptr<std::vector<ShapeAndType>>>
-      input_handle_shapes_and_types(node->num_inputs());
+  // from 'input's InferenceContext, and store into this node's
+  // InferenceContext.
   for (const Edge* e : node->in_edges()) {
     if (e->IsControlEdge()) continue;
+
+    if (e->dst_input() < 0) {
+      return tensorflow::errors::Internal(
+          "Index ", e->dst_input(), " is negative but not a control edge.");
+    }
 
     const Node* input = e->src();
     auto it = node_to_context_.find(input);
     if (it == node_to_context_.end()) {
-      return errors::FailedPrecondition(
-          "Input ", e->dst_input(), " ('", input->name(), "') for '",
-          node->name(), "' was not previously added to ShapeRefiner.");
+      // v1 control flow adds loops to the graph; we have to break them
+      // somewhere, so we'll ignore this input and leave its shape undefined.
+      ic->SetInput(e->dst_input(), ic->UnknownShape());
+      continue;
     }
 
-    InferenceContext* c = it->second->get_context();
-    DCHECK_GE(e->dst_input(), 0);
-    input_nodes[e->dst_input()] = input;
-    input_shapes[e->dst_input()] = c->output(e->src_output());
+    InferenceContext* input_ic = it->second->get_context();
+    ic->SetInput(e->dst_input(), input_ic->output(e->src_output()));
 
-    // Only propagate handle data of edges which are carrying resource handles.
-    if (e->src()->output_type(e->src_output()) == DT_RESOURCE) {
-      const auto* in_v = c->output_handle_shapes_and_types(e->src_output());
-      if (in_v != nullptr) {
-        input_handle_shapes_and_types[e->dst_input()].reset(
-            new std::vector<ShapeAndType>(*in_v));
-      }
+    const auto* in_v =
+        input_ic->output_handle_shapes_and_types(e->src_output());
+    if (in_v != nullptr) {
+      DataType input_type = e->src()->output_type(e->src_output());
+      DCHECK(input_type == DT_RESOURCE || input_type == DT_VARIANT);
+      ic->set_input_handle_shapes_and_types(e->dst_input(),
+                                            std::vector<ShapeAndType>(*in_v));
     }
   }
 
@@ -252,21 +237,8 @@ Status ShapeRefiner::AddNode(const Node* node) {
         "', did you forget to define it?");
   }
 
-  // This needs to be filled in with real data in a second pass.
-  std::vector<const Tensor*> input_tensors(node->num_inputs(), nullptr);
-  std::vector<ShapeHandle> input_tensors_as_shapes;
-
-  // Create the inference context for this node with the existing input shapes.
-  std::unique_ptr<InferenceContext> c(
-      new InferenceContext(graph_def_version_, &node->def(), node->op_def(),
-                           input_shapes, input_tensors, input_tensors_as_shapes,
-                           std::move(input_handle_shapes_and_types)));
-  if (!c->construction_status().ok()) {
-    return c->construction_status();
-  }
-
   std::unique_ptr<ExtendedInferenceContext> ec(
-      new ExtendedInferenceContext(std::move(c), node));
+      new ExtendedInferenceContext(std::move(ic), node));
 
   // Run the shape inference function, and return if there was an error.
   TF_RETURN_IF_ERROR(RunShapeFn(node, op_reg_data, ec.get()));
@@ -288,6 +260,11 @@ Status ShapeRefiner::SetShape(const Node* node, int output_port,
     return errors::InvalidArgument(
         "output_port '", output_port, "' is out of range, ", "node '",
         node->name(), "' has ", node->num_outputs(), " outputs");
+  }
+  // Note: it's possible, if the node's been updated, that the shape inference
+  // context doesn't have the right number of outputs.
+  if (node->num_outputs() > c->num_outputs()) {
+    TF_RETURN_IF_ERROR(c->ExpandOutputs(node->num_outputs()));
   }
 
   // Check compatibility, and merge the shapes.
@@ -350,6 +327,11 @@ Status ShapeRefiner::UpdateNode(const Node* node, bool relax, bool* refined) {
           *refined = true;
         }
       }
+    }
+    if (node_context->requested_input_tensor_as_partial_shape(dst_input)) {
+      // The input value may have changed. Since we have no way to know if
+      // that's indeed the case, err on the safe side.
+      *refined = true;
     }
 
     // Also propagate handle shape and dtype of edges which are carrying
@@ -417,6 +399,32 @@ Status ShapeRefiner::EvaluateConstantTensorForEdge(const Node* node,
                                 kMaxTensorSize, disable_constant_propagation_);
 }
 
+Status ShapeRefiner::EvaluateConstantIntScalarEdge(const Node* node,
+                                                   int dst_idx, bool* evaluated,
+                                                   int64* result) {
+  Tensor scalar;
+  TF_RETURN_IF_ERROR(
+      EvaluateConstantTensorForEdge(node, dst_idx, evaluated, &scalar));
+  if (*evaluated) {
+    if (scalar.NumElements() != 1) {
+      return errors::InvalidArgument(
+          "EvaluateConstantIntScalarEdge called on non-scalar edge: ",
+          scalar.NumElements());
+    }
+    if (scalar.dtype() == DT_INT32) {
+      *result = scalar.scalar<int32>()();
+    } else {
+      if (scalar.dtype() != DT_INT64) {
+        return errors::InvalidArgument(
+            "EvaluateConstantIntScalarEdge called on non-integer edge: ",
+            scalar.dtype());
+      }
+      *result = scalar.scalar<int64>()();
+    }
+  }
+  return Status::OK();
+}
+
 Status ShapeRefiner::ConstantPartialShape(InferenceContext* target_context,
                                           const Node* node, int dst_idx,
                                           ShapeHandle* result) {
@@ -426,6 +434,32 @@ Status ShapeRefiner::ConstantPartialShape(InferenceContext* target_context,
   InferenceContext* src_context = GetContext(input_edge->src());
   if (src_context == nullptr) return errors::Internal("Missing src context");
   ShapeHandle src_shape = src_context->output(input_edge->src_output());
+
+  if (src_context->Value(src_context->Rank(src_shape)) == 0) {
+    Tensor t;
+    bool evaluated = false;
+    TF_RETURN_IF_ERROR(
+        EvaluateConstantTensorForEdge(node, dst_idx, &evaluated, &t));
+    if (!evaluated) {
+      return errors::InvalidArgument(
+          "Received a shape scalar with unknown static value.  A static value "
+          "of '-1' is required to represent an unknown shape.");
+    }
+    if (t.dims() == 0) {
+      if (t.dtype() == DT_INT32 && t.scalar<int32>()() == -1) {
+        *result = target_context->UnknownShape();
+        return Status::OK();
+      } else if (t.dtype() == DT_INT64 && t.scalar<int64>()() == -1) {
+        *result = target_context->UnknownShape();
+        return Status::OK();
+      }
+    }
+    return errors::InvalidArgument(
+        "Received an invalid shape scalar with a static value that is not "
+        "'-1': ",
+        t.DebugString());
+  }
+
   TF_RETURN_IF_ERROR(src_context->WithRank(src_shape, 1, &src_shape));
 
   const string& src_op = input_edge->src()->type_string();
@@ -433,6 +467,40 @@ Status ShapeRefiner::ConstantPartialShape(InferenceContext* target_context,
     // Source tensor is a vector of length 0, so the shape it
     // represents is as scalar.
     *result = target_context->Scalar();
+  } else if (src_op == "Cast") {
+    // First try to evaluate the current tensor, as it might be a valid cast of
+    // a float.
+    Tensor t;
+    bool evaluated = false;
+    if (EvaluateConstantTensorForEdge(node, dst_idx, &evaluated, &t).ok()) {
+      if (evaluated &&
+          target_context->MakeShapeFromTensor(&t, src_shape, result).ok()) {
+        return Status::OK();
+      }
+    }
+
+    // Then try to infer partial shape from the input to the cast tensor.
+    ShapeHandle pre_cast_shape;
+    if (!ConstantPartialShape(target_context, input_edge->src(), 0,
+                              &pre_cast_shape)
+             .ok()) {
+      TF_RETURN_IF_ERROR(
+          target_context->MakeShapeFromTensor(nullptr, src_shape, result));
+    }
+    if (!target_context->RankKnown(pre_cast_shape)) {
+      // Failed to evaluate. Treat the output as completely unknown.
+      *result = target_context->UnknownShape();
+      return Status::OK();
+    }
+    auto* dest_type = input_edge->src()->attrs().Find("DstT");
+    if (dest_type == nullptr || dest_type->value_case() != AttrValue::kType ||
+        (dest_type->type() != DT_INT32 && dest_type->type() != DT_INT64)) {
+      // Casting to a weird type. Do not attempt to infer across it.
+      *result = target_context->MakeShape(std::vector<DimensionHandle>(
+          target_context->Rank(pre_cast_shape), target_context->UnknownDim()));
+      return Status::OK();
+    }
+    *result = pre_cast_shape;
   } else if (src_op == "Shape") {
     *result = src_context->input(0);
   } else if (src_op == "ShapeN") {
@@ -441,19 +509,11 @@ Status ShapeRefiner::ConstantPartialShape(InferenceContext* target_context,
     std::vector<DimensionHandle> dims;
     // Pack is concatenating its input scalars to form the shape tensor vector.
     for (int i = 0; i < src_context->num_inputs(); ++i) {
-      Tensor scalar;
-      bool evaluated = false;
-      TF_RETURN_IF_ERROR(EvaluateConstantTensorForEdge(input_edge->src(), i,
-                                                       &evaluated, &scalar));
+      int64 size;
+      bool evaluated;
+      TF_RETURN_IF_ERROR(EvaluateConstantIntScalarEdge(input_edge->src(), i,
+                                                       &evaluated, &size));
       if (evaluated) {
-        int64 size;
-        if (scalar.dtype() == DT_INT32) {
-          size = scalar.scalar<int32>()();
-        } else if (scalar.dtype() == DT_INT64) {
-          size = scalar.scalar<int64>()();
-        } else {
-          return errors::InvalidArgument("Pack input must be int32 or int64");
-        }
         dims.push_back(size < 0 ? target_context->UnknownDim()
                                 : target_context->MakeDim(size));
       } else {
@@ -483,6 +543,16 @@ Status ShapeRefiner::ConstantPartialShape(InferenceContext* target_context,
       TF_RETURN_IF_ERROR(
           target_context->Concatenate(*result, sub_result, result));
     }
+  } else if (src_op == "StridedSlice") {
+    TF_RETURN_IF_ERROR(
+        PartialStridedSliceShape(input_edge->src(), src_context, result));
+  } else if (src_op == "VariableShape") {
+    auto* handle_data = src_context->input_handle_shapes_and_types(0);
+    if (handle_data != nullptr && !handle_data->empty()) {
+      *result = handle_data->at(0).shape;
+    } else {
+      *result = target_context->UnknownShape();
+    }
   } else {
     Tensor t;
     bool evaluated = false;
@@ -491,6 +561,78 @@ Status ShapeRefiner::ConstantPartialShape(InferenceContext* target_context,
     TF_RETURN_IF_ERROR(target_context->MakeShapeFromTensor(
         evaluated ? &t : nullptr, src_shape, result));
   }
+  return Status::OK();
+}
+
+Status ShapeRefiner::PartialStridedSliceShape(Node* slice_node,
+                                              InferenceContext* ctx,
+                                              ShapeHandle* result) {
+  // Only attempt to evaluate if begin/end/strides all are scalars.
+  for (int i = 1; i <= 3; ++i) {
+    ShapeHandle input_shape = ctx->input(i);
+    if (ctx->Value(ctx->Dim(input_shape, 0)) != 1) {
+      *result = ctx->UnknownShape();
+      return Status::OK();
+    }
+  }
+
+  int begin_mask, end_mask, ellipsis_mask, new_axis_mask, shrink_axis_mask;
+  TF_RETURN_IF_ERROR(
+      GetNodeAttr(slice_node->attrs(), "begin_mask", &begin_mask));
+  TF_RETURN_IF_ERROR(GetNodeAttr(slice_node->attrs(), "end_mask", &end_mask));
+  TF_RETURN_IF_ERROR(
+      GetNodeAttr(slice_node->attrs(), "ellipsis_mask", &ellipsis_mask));
+  TF_RETURN_IF_ERROR(
+      GetNodeAttr(slice_node->attrs(), "new_axis_mask", &new_axis_mask));
+  TF_RETURN_IF_ERROR(
+      GetNodeAttr(slice_node->attrs(), "shrink_axis_mask", &shrink_axis_mask));
+
+  // Only attempt to evaluate if there are no special masks set (note that we
+  // can handle begin/end_mask == 1).
+  if (!(begin_mask == 0 || begin_mask == 1) ||
+      !(end_mask == 0 || end_mask == 1) || ellipsis_mask != 0 ||
+      new_axis_mask != 0 || shrink_axis_mask != 0) {
+    *result = ctx->UnknownShape();
+    return Status::OK();
+  }
+
+  bool evaluated;
+  int64 begin;
+  if (begin_mask == 1) {
+    begin = 0;
+  } else {
+    TF_RETURN_IF_ERROR(
+        EvaluateConstantIntScalarEdge(slice_node, 1, &evaluated, &begin));
+    if (!evaluated) {
+      *result = ctx->UnknownShape();
+      return Status::OK();
+    }
+  }
+
+  int64 end;
+  if (end_mask == 1) {
+    end = std::numeric_limits<int64>::max();
+  } else {
+    TF_RETURN_IF_ERROR(
+        EvaluateConstantIntScalarEdge(slice_node, 2, &evaluated, &end));
+    if (!evaluated) {
+      *result = ctx->UnknownShape();
+      return Status::OK();
+    }
+  }
+
+  int64 stride;
+  TF_RETURN_IF_ERROR(
+      EvaluateConstantIntScalarEdge(slice_node, 3, &evaluated, &stride));
+  if (!evaluated) {
+    *result = ctx->UnknownShape();
+    return Status::OK();
+  }
+
+  // Apply stride to input interpreted as a partial shape.
+  ShapeHandle input;
+  TF_RETURN_IF_ERROR(ConstantPartialShape(ctx, slice_node, 0, &input));
+  TF_RETURN_IF_ERROR(ctx->Subshape(input, begin, end, stride, result));
   return Status::OK();
 }
 
@@ -512,13 +654,29 @@ Status ShapeRefiner::RunShapeFn(const Node* node,
   // Run the shape inference function, and return if there was an error.
   // Capture as lambda, because we might need to re-run inference later on.
   auto run_inference_lambda = [&]() {
-    if (function_library_ && op_reg_data->is_function_op) {
-      // Special inference logic for user-defined functions.
-
-      auto* func_def = function_library_->Find(op_reg_data->op_def.name());
-      if (func_def) {
-        return InferShapesForFunction(func_def, keep_nested_shape_inferences_,
-                                      ec);
+    if (function_library_ && IsFunctionCall(*function_library_, *node)) {
+      bool disable_shape_inference;
+      if (!GetNodeAttr(AttrSlice(node->def()), "_disable_call_shape_inference",
+                       &disable_shape_inference)
+               .ok() ||
+          !disable_shape_inference) {
+        // Special inference logic for user-defined functions.
+        NameAttrList function;
+        TF_RETURN_IF_ERROR(
+            NameAndAttrsFromFunctionCall(node->def(), &function));
+        const FunctionDef* function_def =
+            function_library_->Find(function.name());
+        if (function_def != nullptr) {
+          // The constant Tensor map we have for the outside context is not
+          // valid inside the function. We need to push a new clean map while
+          // performing inference on the function body.
+          auto const_tensor_map_copy = const_tensor_map_;
+          const_tensor_map_.clear();
+          Status function_inference_status = InferShapesForFunction(
+              function_def, AttrSlice(&function.attr()), ec);
+          const_tensor_map_ = const_tensor_map_copy;
+          return function_inference_status;
+        }
       }
     }
 

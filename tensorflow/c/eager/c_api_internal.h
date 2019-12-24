@@ -15,305 +15,264 @@ limitations under the License.
 #ifndef TENSORFLOW_C_EAGER_C_API_INTERNAL_H_
 #define TENSORFLOW_C_EAGER_C_API_INTERNAL_H_
 
-#include "tensorflow/c/eager/c_api.h"
-
 #include <algorithm>
 #include <cstddef>
 #include <map>
 #include <memory>
 #include <queue>
 #include <string>
-#include <thread>
 #include <vector>
 
 #include "tensorflow/c/c_api.h"
 #include "tensorflow/c/c_api_internal.h"
-#include "tensorflow/c/eager/runtime.h"
+#include "tensorflow/c/eager/c_api.h"
+#include "tensorflow/c/eager/c_api_experimental.h"
 #include "tensorflow/core/common_runtime/device_factory.h"
+#include "tensorflow/core/common_runtime/eager/attr_builder.h"
+#include "tensorflow/core/common_runtime/eager/context.h"
+#include "tensorflow/core/common_runtime/eager/eager_executor.h"
+#include "tensorflow/core/common_runtime/eager/eager_operation.h"
+#include "tensorflow/core/common_runtime/eager/kernel_and_device.h"
+#include "tensorflow/core/common_runtime/eager/tensor_handle.h"
 #include "tensorflow/core/common_runtime/function.h"
 #include "tensorflow/core/common_runtime/rendezvous_mgr.h"
+#include "tensorflow/core/framework/cancellation.h"
 #include "tensorflow/core/framework/rendezvous.h"
+#include "tensorflow/core/lib/core/errors.h"
+#include "tensorflow/core/lib/core/stringpiece.h"
 #include "tensorflow/core/lib/gtl/inlined_vector.h"
 #include "tensorflow/core/lib/gtl/map_util.h"
-#include "tensorflow/core/lib/gtl/stl_util.h"
+#include "tensorflow/core/lib/monitoring/counter.h"
+#include "tensorflow/core/lib/monitoring/gauge.h"
+#include "tensorflow/core/lib/monitoring/sampler.h"
 #include "tensorflow/core/platform/mutex.h"
 #include "tensorflow/core/platform/thread_annotations.h"
+#include "tensorflow/core/profiler/lib/profiler_session.h"
 #include "tensorflow/core/public/version.h"
-
-// A unit of execution for the TFE_Executor class below. Example subclasses
-// encapsulate execution of a TFE_Op, or copying a TFE_TensorHandle from one
-// device to another.
-class TFE_Node {
- public:
-  explicit TFE_Node(tensorflow::uint64 id);
-
-  virtual ~TFE_Node() {}
-
-  // Runs the computation corresponding to this node and blocks till the
-  // execution is done.
-  virtual tensorflow::Status Run() = 0;
-
-  // An id unique to the TFE_Context under which this node is created. Allocated
-  // monotonically.
-  const tensorflow::uint64 id;
-};
-
-// A class for handling async execution (see TFE_ContextSetAsync).
-// Note that this class is thread-safe.
-// TODO(agarwal): TFE_OpAddInput may currently block if it tries to access the
-// device of the input handle. Fix that.
-// TODO(agarwal): On error, mark all affected handles as corrupted.
-// TODO(agarwal): Implement support for control dependencies.
-// TODO(agarwal): Support out-of-order execution and dispatching multiple
-// TFE_Node in parallel.
-// TODO(agarwal): Implement optimizations over TFE_Node traces.
-class TFE_Executor {
- public:
-  ~TFE_Executor();
-
-  // This is called whenever async mode is enabled. Note that it may be called
-  // multiple times as different calling threads may switch async mode on or off
-  // independently.
-  void EnableAsync();
-
-  // Helper function to create monotonically increasing ids unique to this
-  // object.
-  tensorflow::uint64 NextId();
-
-  // Schedules `node` for execution.
-  // Note that Add must be called in monotonically increasing order of node->id.
-  void Add(TFE_Node* node);
-
-  // Causes the caller to block till node with id `node_id` has finished
-  // execution.
-  tensorflow::Status WaitFor(tensorflow::uint64 node_id);
-
-  // Blocks till all currently pending ops are done.
-  tensorflow::Status WaitForAllPendingNodes();
-
-  // Clears all currently set errors which re-enables async execution.
-  void ClearError();
-
-  // Returns Status based on any errors that occurred during async execution.
-  tensorflow::Status status();
-
- private:
-  // Starts execution of pending TFE_Nodes. This function loops till
-  // thread_done_ is set to true. If any errors are encontered, these are set
-  // inside `status_`. The loop blocks anytime there are no pending nodes, or if
-  // `status_` is not ok.
-  void Run();
-
-  tensorflow::Status WaitImpl(bool wait_all, tensorflow::uint64 node_id);
-
-  tensorflow::mutex node_queue_mutex_;
-
-  // Used to signal that some TFE_Nodes are pending execution.
-  tensorflow::condition_variable nodes_pending_ GUARDED_BY(node_queue_mutex_);
-
-  // Queue of pending TFE_Nodes.
-  std::queue<TFE_Node*> node_queue_ GUARDED_BY(node_queue_mutex_);
-
-  // `status_` is set based on any errors raised during execution of a TFE_Node.
-  // It remains set until ClearError is called.
-  tensorflow::Status status_ GUARDED_BY(node_queue_mutex_);
-
-  // Map from id of a TFE_Node to condition_variables (not owned by the map).
-  // These condition_variables are notified and removed when that TFE_Node is
-  // done executing, or if an error is found in execution of any TFE_Node.
-  std::multimap<tensorflow::uint64, tensorflow::condition_variable*>
-      node_done_notifications_ GUARDED_BY(node_queue_mutex_);
-
-  // Thread object that calls the `Run` method. Currently we use only one thread
-  // for executing the TFE_Nodes one-by-one.
-  std::unique_ptr<tensorflow::Thread> thread_ GUARDED_BY(node_queue_mutex_);
-
-  // Indicates that `thread_` should stop as soon as it is done executing the
-  // current TFE_Node.
-  bool thread_done_ GUARDED_BY(node_queue_mutex_) = false;
-
-  tensorflow::mutex next_id_mutex_;
-  tensorflow::uint64 next_id_ GUARDED_BY(next_id_mutex_) = 1;
-};
 
 struct TFE_ContextOptions {
   TF_SessionOptions session_options;
   // true if async execution is enabled.
   bool async = false;
-  TFE_ContextDevicePlacementPolicy policy{
-      TFE_DEVICE_PLACEMENT_SILENT_FOR_INT32};
+  TFE_ContextDevicePlacementPolicy device_placement_policy{
+      TFE_DEVICE_PLACEMENT_SILENT};
+  TFE_ContextMirroringPolicy mirroring_policy{TFE_MIRRORING_NONE};
+  // If true, lazily copy the remote inputs of a function to the target devices.
+  bool lazy_remote_inputs_copy = true;
 };
-
-TFE_ContextDevicePlacementPolicy PlacementPolicy(
-    bool soft_placement, TFE_ContextDevicePlacementPolicy original_policy);
 
 struct TFE_Context {
-  explicit TFE_Context(const TFE_ContextOptions& opts,
-                       std::unique_ptr<tensorflow::DeviceMgr> device_mgr,
-                       tensorflow::Rendezvous* rendezvous)
-      : soft_placement(
-            opts.session_options.options.config.allow_soft_placement()),
-        policy(PlacementPolicy(soft_placement, opts.policy)),
-        device_manager(std::move(device_mgr)),
-        devices(device_manager->ListDevices()),
-        rendezvous(rendezvous),
-        pflr(new tensorflow::ProcessFunctionLibraryRuntime(
-            device_manager.get(), opts.session_options.options.env,
-            TF_GRAPH_DEF_VERSION, &func_lib_def, {})),
-        log_device_placement(
-            opts.session_options.options.config.log_device_placement()),
-        async_default(opts.async) {
-    if (async_default) executor.EnableAsync();
+  TFE_Context(const tensorflow::SessionOptions& opts,
+              TFE_ContextDevicePlacementPolicy default_device_placement_policy,
+              TFE_ContextMirroringPolicy default_mirroring_policy, bool async,
+              const bool lazy_remote_inputs_copy,
+              const tensorflow::DeviceMgr* device_mgr, bool device_mgr_owned,
+              tensorflow::Rendezvous* rendezvous,
+              const tensorflow::CustomKernelCreator* custom_kernel_creator)
+      : context(new tensorflow::EagerContext(
+            opts,
+            static_cast<tensorflow::ContextDevicePlacementPolicy>(
+                default_device_placement_policy),
+            static_cast<tensorflow::ContextMirroringPolicy>(
+                default_mirroring_policy),
+            async, lazy_remote_inputs_copy, device_mgr, device_mgr_owned,
+            rendezvous, custom_kernel_creator)) {}
+
+  ~TFE_Context() {
+    // TODO(iga): Add a separate API method to shutdown TFE_Context so that we
+    // don't send RPCs and block in destructor.
+    context->WaitForAndCloseRemoteContexts();
+    // context->RefCountIsOne() should be true here.
+    // TODO(iga): Remove EagerContext refcounting.
+    context->Unref();
   }
 
-  const bool soft_placement;
-  const TFE_ContextDevicePlacementPolicy policy;
-
-  // Note: we cannot use C++11 thread_local here as there is no concept of a
-  // thread-local-object-local variable in C++11.
-  tensorflow::mutex policy_map_mu;
-  std::unordered_map<std::thread::id, TFE_ContextDevicePlacementPolicy>
-      thread_local_policies GUARDED_BY(policy_map_mu);
-
-  std::unique_ptr<tensorflow::DeviceMgr> device_manager;
-  // Devices owned by device_manager
-  const std::vector<tensorflow::Device*> devices;
-  tensorflow::Rendezvous* const rendezvous;
-
-  tensorflow::mutex functions_mu;
-  tensorflow::FunctionLibraryDefinition func_lib_def GUARDED_BY(functions_mu){
-      tensorflow::OpRegistry::Global(), {}};
-
-  // One FunctionLibraryRuntime per device.
-  // func_libs[i] is the FunctionLibraryRuntime corresponding to
-  // session->devices[i].
-  const std::unique_ptr<tensorflow::ProcessFunctionLibraryRuntime> pflr;
-
-  tensorflow::mutex cache_mu;
-  std::unordered_map<tensorflow::Fprint128, tensorflow::KernelAndDevice*,
-                     tensorflow::Fprint128Hasher>
-      kernel_cache GUARDED_BY(cache_mu);
-
-  tensorflow::FunctionLibraryRuntime* func_lib(tensorflow::Device* d) const {
-    return pflr->GetFLR(d->name());
-  }
-
-  // Whether we should compute RunMetadata.
-  std::atomic<bool> should_store_metadata{false};
-  tensorflow::mutex metadata_mu;
-  tensorflow::RunMetadata run_metadata GUARDED_BY(metadata_mu);
-  const bool log_device_placement;
-  // TFE_Executor for async execution.
-  TFE_Executor executor;
-
-  // True if running in asynchronous mode.
-  bool Async() const;
-
-  // True if the default value for execution mode is async. Note that this value
-  // can be overridden per thread based on `thread_local_async` overrides.
-  const bool async_default;
-  mutable tensorflow::mutex async_map_mu;
-  std::unordered_map<std::thread::id, bool> thread_local_async
-      GUARDED_BY(async_map_mu);
+  tensorflow::EagerContext* context;
 };
 
-struct TFE_TensorHandle : public tensorflow::core::RefCounted {
- public:
-  TFE_TensorHandle(const tensorflow::Tensor& t, tensorflow::Device* d,
-                   tensorflow::Device* op_device)
-      : dtype(t.dtype()),
-        node_id(0),
-        tensor_(t),
-        device_(d),
-        op_device_(op_device),
-        ctx_(nullptr) {}
-
-  TFE_TensorHandle(tensorflow::uint64 node_id, tensorflow::DataType dtype,
-                   TFE_Context* ctx)
-      : dtype(dtype),
-        node_id(node_id),
-        tensor_(dtype),
-        device_(nullptr),
-        op_device_(nullptr),
-        ctx_(ctx) {
-    DCHECK_GT(node_id, 0);
+struct TFE_TensorHandle {
+  explicit TFE_TensorHandle(tensorflow::TensorHandle* h) : handle(h) {}
+  static TFE_TensorHandle* CreateLocalHandle(const class tensorflow::Tensor& t,
+                                             TF_Status* s) {
+    tensorflow::TensorHandle* handle;
+    s->status = tensorflow::TensorHandle::CreateLocalHandle(t, &handle);
+    if (!s->status.ok()) {
+      return nullptr;
+    }
+    return new TFE_TensorHandle(handle);
   }
 
-  ~TFE_TensorHandle() override {}
+  tensorflow::TensorHandle* handle;
+};
 
-  tensorflow::Status Tensor(const tensorflow::Tensor** t);
+struct TFE_TensorDebugInfo {
+  explicit TFE_TensorDebugInfo(const std::vector<tensorflow::int64>& dims)
+      : dev_dims(dims) {}
 
-  tensorflow::Status Device(tensorflow::Device** d);
+  // Fully-padded, minor-to-major.
+  std::vector<tensorflow::int64> dev_dims;
+};
 
-  tensorflow::Status OpDevice(tensorflow::Device** d);
+struct TFE_OpInferenceContext {
+  explicit TFE_OpInferenceContext(const tensorflow::OpDef* op_def)
+      : op_def(op_def) {}
 
-  tensorflow::Status TensorAndDevice(const tensorflow::Tensor** tensor,
-                                     tensorflow::Device** device,
-                                     tensorflow::Device** op_device);
-
-  // Note that this can be called at most once, and only on non-ready handles,
-  // and makes them ready.
-  void SetTensorAndDevice(const tensorflow::Tensor& tensor,
-                          tensorflow::Device* device,
-                          tensorflow::Device* op_device);
-
-  // dtype for the handle. It must be the same as t.dtype() once the handle is
-  // ready.
-  const tensorflow::DataType dtype;
-
- private:
-  // If the contents of the Tensor pointed to by this handle is yet to be
-  // computed by a TFE_Node, this function will block till that compuatation is
-  // done and the handle is "ready".
-  tensorflow::Status WaitReady();
-
-  bool IsReady();
-
-  // Id for the TFE_Node that will compute the value pointed to by this handle.
-  // If the value is 0, the handle is already ready, but not vice-versa.
-  const tensorflow::uint64 node_id;
-
-  tensorflow::Tensor tensor_;
-
-  // TODO(ashankar): device_ == nullptr iff local CPU
-  // This was expedient, but perhaps worth revisiting ('device_' should always
-  // be a valid pointer?)
-  // This can be done if TFE_NewOp() and the TFE_TensorHandle constructors are
-  // provided with the appropriate TFE_Context.
-  //
-  // TODO(ashankar): Reference count TFE_Context to ensure that 'device_' of a
-  // TFE_TensorHandle does not outlive the TFE_Context from which it came?
-  tensorflow::Device* device_;
-
-  // Device in which the op producing this tensor was executed. Equals to
-  // device_ for constant tensors.
-  tensorflow::Device* op_device_;
-
-  tensorflow::mutex ctx_mutex_;
-
-  // `ctx` is only guaranteed to be set if the handle is not "ready". This is
-  // typically true when the handle was produced during async execution.
-  // `ctx` object is not owned and should outlive this handle.
-  TFE_Context* ctx_ GUARDED_BY(ctx_mutex_);
+  const tensorflow::OpDef* op_def;  // op definition from protobuf
+  int input_arg_idx = 0;  // arg definition index for the next input to be added
+  tensorflow::gtl::FlatSet<std::string> attrs;  // attributes inferred so far
 };
 
 struct TFE_Op {
-  // t is NULL iff the TFE_Op corresponds to a TensorFlow function instead of a
-  // primitive operation.
-  TFE_Op(TFE_Context* ctx, const char* op, const tensorflow::AttrTypeMap* t)
-      : ctx(ctx), name(op), attrs(op), attr_types(t), device(nullptr) {}
+  TFE_Op(TFE_Context* ctx, const char* op, bool is_function,
+         const tensorflow::AttrTypeMap* t,
+         TFE_OpInferenceContext* inference_ctx)
+      : operation(ctx->context, op, is_function, t),
+        inference_ctx(inference_ctx) {}
 
-  ~TFE_Op();
+  void Clear() {
+    operation.Clear();
+    inference_ctx.reset();
+  }
 
-  bool const is_function() const { return attr_types == nullptr; }
+  tensorflow::Status Reset(TFE_Context* ctx, const char* op, bool is_function,
+                           const tensorflow::AttrTypeMap* t,
+                           const char* raw_device_name,
+                           TFE_OpInferenceContext* infer_ctx) {
+    inference_ctx.reset(infer_ctx);
+    return operation.Reset(ctx->context, op, is_function, t, raw_device_name,
+                           nullptr);
+  }
 
-  TFE_Context* ctx;  // Must outlive the TFE_Op.
-  const tensorflow::string name;
-  tensorflow::AttrBuilder attrs;
-  const tensorflow::AttrTypeMap* attr_types;
-  tensorflow::gtl::InlinedVector<TFE_TensorHandle*, 4> inputs;
-  tensorflow::Device* device;
-  bool use_xla = false;
+  tensorflow::EagerOperation operation;
+  std::unique_ptr<TFE_OpInferenceContext> inference_ctx;
+};
+
+TFE_Op* NewOrResetOp(TFE_Context* ctx, const char* op_or_function_name,
+                     const char* raw_device_name, TF_Status* status,
+                     TFE_Op* op_to_reset = nullptr);
+
+struct TFE_Profiler {
+  explicit TFE_Profiler() { profiler = tensorflow::ProfilerSession::Create(); }
+
+  std::unique_ptr<tensorflow::ProfilerSession> profiler;
+};
+
+struct TFE_MonitoringCounterCell {
+  tensorflow::monitoring::CounterCell cell;
+};
+
+template <int NumLabels>
+struct TFE_MonitoringCounter {
+  template <typename... LabelDesc>
+  TFE_MonitoringCounter(const char* name, const char* description,
+                        LabelDesc&&... label) {
+    counter = absl::WrapUnique(tensorflow::monitoring::Counter<NumLabels>::New(
+        name, description, label...));
+  }
+
+  std::unique_ptr<tensorflow::monitoring::Counter<NumLabels>> counter;
+};
+
+struct TFE_MonitoringCounter0 : TFE_MonitoringCounter<0> {
+  using TFE_MonitoringCounter::TFE_MonitoringCounter;
+};
+struct TFE_MonitoringCounter1 : TFE_MonitoringCounter<1> {
+  using TFE_MonitoringCounter::TFE_MonitoringCounter;
+};
+struct TFE_MonitoringCounter2 : TFE_MonitoringCounter<2> {
+  using TFE_MonitoringCounter::TFE_MonitoringCounter;
+};
+
+struct TFE_MonitoringIntGaugeCell {
+  tensorflow::monitoring::GaugeCell<tensorflow::int64> cell;
+};
+struct TFE_MonitoringStringGaugeCell {
+  tensorflow::monitoring::GaugeCell<tensorflow::string> cell;
+};
+struct TFE_MonitoringBoolGaugeCell {
+  tensorflow::monitoring::GaugeCell<bool> cell;
+};
+
+template <typename ValueType, int NumLabels>
+struct TFE_MonitoringGauge {
+  template <typename... LabelDesc>
+  TFE_MonitoringGauge(const char* name, const char* description,
+                      LabelDesc&&... label) {
+    gauge = absl::WrapUnique(
+        tensorflow::monitoring::Gauge<ValueType, NumLabels>::New(
+            name, description, label...));
+  }
+
+  std::unique_ptr<tensorflow::monitoring::Gauge<ValueType, NumLabels>> gauge;
+};
+
+struct TFE_MonitoringIntGauge0 : TFE_MonitoringGauge<tensorflow::int64, 0> {
+  using TFE_MonitoringGauge::TFE_MonitoringGauge;
+};
+struct TFE_MonitoringIntGauge1 : TFE_MonitoringGauge<tensorflow::int64, 1> {
+  using TFE_MonitoringGauge::TFE_MonitoringGauge;
+};
+struct TFE_MonitoringIntGauge2 : TFE_MonitoringGauge<tensorflow::int64, 2> {
+  using TFE_MonitoringGauge::TFE_MonitoringGauge;
+};
+
+struct TFE_MonitoringStringGauge0 : TFE_MonitoringGauge<tensorflow::string, 0> {
+  using TFE_MonitoringGauge::TFE_MonitoringGauge;
+};
+struct TFE_MonitoringStringGauge1 : TFE_MonitoringGauge<tensorflow::string, 1> {
+  using TFE_MonitoringGauge::TFE_MonitoringGauge;
+};
+struct TFE_MonitoringStringGauge2 : TFE_MonitoringGauge<tensorflow::string, 2> {
+  using TFE_MonitoringGauge::TFE_MonitoringGauge;
+};
+
+struct TFE_MonitoringBoolGauge0 : TFE_MonitoringGauge<bool, 0> {
+  using TFE_MonitoringGauge::TFE_MonitoringGauge;
+};
+struct TFE_MonitoringBoolGauge1 : TFE_MonitoringGauge<bool, 1> {
+  using TFE_MonitoringGauge::TFE_MonitoringGauge;
+};
+struct TFE_MonitoringBoolGauge2 : TFE_MonitoringGauge<bool, 2> {
+  using TFE_MonitoringGauge::TFE_MonitoringGauge;
+};
+
+struct TFE_MonitoringBuckets {
+  explicit TFE_MonitoringBuckets(
+      std::function<std::unique_ptr<tensorflow::monitoring::Buckets>(void)>
+          fn) {
+    create_buckets = fn;
+  }
+
+  std::function<std::unique_ptr<tensorflow::monitoring::Buckets>(void)>
+      create_buckets;
+};
+
+struct TFE_MonitoringSamplerCell {
+  tensorflow::monitoring::SamplerCell cell;
+};
+
+template <int NumLabels>
+struct TFE_MonitoringSampler {
+  template <typename... LabelDesc>
+  TFE_MonitoringSampler(
+      const char* name,
+      std::unique_ptr<tensorflow::monitoring::Buckets> buckets,
+      const char* description, LabelDesc&&... label) {
+    sampler = absl::WrapUnique(tensorflow::monitoring::Sampler<NumLabels>::New(
+        {name, description, label...}, std::move(buckets)));
+  }
+
+  std::unique_ptr<tensorflow::monitoring::Sampler<NumLabels>> sampler;
+};
+
+struct TFE_MonitoringSampler0 : TFE_MonitoringSampler<0> {
+  using TFE_MonitoringSampler::TFE_MonitoringSampler;
+};
+struct TFE_MonitoringSampler1 : TFE_MonitoringSampler<1> {
+  using TFE_MonitoringSampler::TFE_MonitoringSampler;
+};
+struct TFE_MonitoringSampler2 : TFE_MonitoringSampler<2> {
+  using TFE_MonitoringSampler::TFE_MonitoringSampler;
 };
 
 namespace tensorflow {
@@ -322,5 +281,24 @@ void SetOpAttrValueScalar(TFE_Context* ctx, TFE_Op* op,
                           const tensorflow::AttrValue& default_value,
                           const char* attr_name, TF_Status* status);
 }  // namespace tensorflow
+
+struct TFE_CancellationManager {
+  tensorflow::CancellationManager cancellation_manager;
+};
+
+struct TFE_Executor {
+  explicit TFE_Executor(bool async)
+      : owned_executor(new tensorflow::EagerExecutor(async)) {}
+
+  explicit TFE_Executor(tensorflow::EagerExecutor* executor)
+      : owned_executor(nullptr), unowned_executor(executor) {}
+
+  tensorflow::EagerExecutor* executor() {
+    return owned_executor == nullptr ? unowned_executor : owned_executor.get();
+  }
+
+  std::unique_ptr<tensorflow::EagerExecutor> owned_executor;
+  tensorflow::EagerExecutor* unowned_executor;
+};
 
 #endif  // TENSORFLOW_C_EAGER_C_API_INTERNAL_H_

@@ -50,12 +50,16 @@ from tensorflow.python.training import training_ops
 from tensorflow.python.util.tf_export import tf_export
 
 
-@tf_export("train.RMSPropOptimizer")
+@tf_export(v1=["train.RMSPropOptimizer"])
 class RMSPropOptimizer(optimizer.Optimizer):
-  """Optimizer that implements the RMSProp algorithm.
+  """Optimizer that implements the RMSProp algorithm (Tielemans et al.
 
-  See the
-  [paper](http://www.cs.toronto.edu/~tijmen/csc321/slides/lecture_slides_lec6.pdf).
+  2012).
+
+  References:
+    Coursera slide 29:
+    Hinton, 2012
+    ([pdf](http://www.cs.toronto.edu/~tijmen/csc321/slides/lecture_slides_lec6.pdf))
   """
 
   def __init__(self,
@@ -92,6 +96,13 @@ class RMSPropOptimizer(optimizer.Optimizer):
         computation and memory. Defaults to False.
       name: Optional name prefix for the operations created when applying
         gradients. Defaults to "RMSProp".
+
+    @compatibility(eager)
+    When eager execution is enabled, `learning_rate`, `decay`, `momentum`, and
+    `epsilon` can each be a callable that takes no arguments and returns the
+    actual value to use. This can be useful for changing these values across
+    different invocations of optimizer functions.
+    @end_compatibility
     """
     super(RMSPropOptimizer, self).__init__(use_locking, name)
     self._learning_rate = learning_rate
@@ -120,12 +131,15 @@ class RMSPropOptimizer(optimizer.Optimizer):
       self._zeros_slot(v, "momentum", self._name)
 
   def _prepare(self):
-    self._learning_rate_tensor = ops.convert_to_tensor(
-        self._learning_rate, name="learning_rate")
-    self._decay_tensor = ops.convert_to_tensor(self._decay, name="decay")
-    self._momentum_tensor = ops.convert_to_tensor(
-        self._momentum, name="momentum")
-    self._epsilon_tensor = ops.convert_to_tensor(self._epsilon, name="epsilon")
+    lr = self._call_if_callable(self._learning_rate)
+    decay = self._call_if_callable(self._decay)
+    momentum = self._call_if_callable(self._momentum)
+    epsilon = self._call_if_callable(self._epsilon)
+
+    self._learning_rate_tensor = ops.convert_to_tensor(lr, name="learning_rate")
+    self._decay_tensor = ops.convert_to_tensor(decay, name="decay")
+    self._momentum_tensor = ops.convert_to_tensor(momentum, name="momentum")
+    self._epsilon_tensor = ops.convert_to_tensor(epsilon, name="epsilon")
 
   def _apply_dense(self, grad, var):
     rms = self.get_slot(var, "rms")

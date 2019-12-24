@@ -351,6 +351,56 @@ TEST_F(FreezeTest, GraphDefWithNoVariables) {
   GraphDefEqual(frozen_graph_def, graph_def);
 }
 
+TEST_F(FreezeTest, GraphDefWithMultiOutputOperation) {
+  // Tensors from operations with multiple outputs get tensor suffixes when used
+  // in input fields of following nodes, i.e. split:0, split:1.
+  // Test that we traverse those correctly.
+  SavedModelBundle saved_model_bundle;
+  GraphDef graph_def;
+  Scope scope = Scope::NewRootScope();
+  Output a = ops::Const(scope.WithOpName("a"), {10.0f, 10.0f}, {2});
+  Output axis = ops::Const(scope.WithOpName("axis"), 0, {});
+  OutputList split = ops::Split(scope.WithOpName("split"), axis, a, 2).output;
+  Output b = ops::Const(scope.WithOpName("b"), 10.0f, {});
+  Output c = ops::Mul(scope.WithOpName("c"), split[1], b);
+  TF_ASSERT_OK(scope.ToGraphDef(&graph_def));
+  TF_ASSERT_OK(AddGraphDefWithOutputsToSavedModelBundle(graph_def, {"c:0"}, "",
+                                                        &saved_model_bundle));
+
+  GraphDef frozen_graph_def;
+  std::unordered_set<string> inputs;
+  std::unordered_set<string> outputs;
+  TF_ASSERT_OK(FreezeSavedModel(saved_model_bundle, &frozen_graph_def, &inputs,
+                                &outputs));
+
+  GraphDefEqual(frozen_graph_def, graph_def);
+}
+
+TEST_F(FreezeTest, GraphDefWithControlDependency) {
+  // Inputs that are control dependencies get tensor prefixes,
+  // i.e. ^control_dependency.
+  // Test that we traverse those correctly.
+  SavedModelBundle saved_model_bundle;
+  GraphDef graph_def;
+  Scope scope = Scope::NewRootScope();
+  Output source = ops::Const(scope.WithOpName("source"), 10.0f, {});
+  Output a = ops::Const(scope.WithOpName("a").WithControlDependencies(source),
+                        {10.0f, 10.0f}, {2});
+  Output b = ops::Const(scope.WithOpName("b"), 10.0f, {});
+  Output c = ops::Mul(scope.WithOpName("c"), a, b);
+  TF_ASSERT_OK(scope.ToGraphDef(&graph_def));
+  TF_ASSERT_OK(AddGraphDefWithOutputsToSavedModelBundle(graph_def, {"c:0"}, "",
+                                                        &saved_model_bundle));
+
+  GraphDef frozen_graph_def;
+  std::unordered_set<string> inputs;
+  std::unordered_set<string> outputs;
+  TF_ASSERT_OK(FreezeSavedModel(saved_model_bundle, &frozen_graph_def, &inputs,
+                                &outputs));
+
+  GraphDefEqual(frozen_graph_def, graph_def);
+}
+
 TEST_F(FreezeTest, GraphDefWithoutDependentVariables) {
   TestFreezeGraphWithoutDependentVariables(false);
 }
@@ -373,6 +423,64 @@ TEST_F(FreezeTest, GraphDefWithAndWithoutDependentVariables) {
 
 TEST_F(FreezeTest, GraphDefWithAndWithoutDependentResourceVariables) {
   TestFreezeGraphWithAndWithoutDependentVariables(true);
+}
+
+TEST_F(FreezeTest, InputsAndOutputsCompositeTensorSignatureDef) {
+  // Test that inputs and outputs get correctly populated for a
+  // SignatureDef containing composite tensor inputs and outputs.
+  SavedModelBundle saved_model_bundle;
+  SignatureDef signature_def;
+
+  TensorInfo& in = (*signature_def.mutable_inputs())["input_arg"];
+  in.mutable_composite_tensor()->add_components()->set_name("input1:0");
+  in.mutable_composite_tensor()->add_components()->set_name("input2:0");
+
+  TensorInfo& out = (*signature_def.mutable_outputs())["output_arg"];
+  out.mutable_composite_tensor()->add_components()->set_name("output2:0");
+  out.mutable_composite_tensor()->add_components()->set_name("output1:0");
+
+  AddSignatureDefToSavedModelBundle(signature_def, "signature_def",
+                                    &saved_model_bundle);
+  GraphDef frozen_graph_def;
+  std::unordered_set<string> inputs;
+  std::unordered_set<string> outputs;
+  TF_ASSERT_OK(FreezeSavedModel(saved_model_bundle, &frozen_graph_def, &inputs,
+                                &outputs));
+  std::unordered_set<string> expected_inputs = {"input1:0", "input2:0"};
+  std::unordered_set<string> expected_outputs = {"output1:0", "output2:0"};
+  EXPECT_EQ(expected_inputs, inputs);
+  EXPECT_EQ(expected_outputs, outputs);
+}
+
+TEST_F(FreezeTest, InputsAndOutputsSparseCooSignatureDef) {
+  // Test that inputs and outputs get correctly populated for a
+  // SignatureDef containing composite tensor inputs and outputs.
+  SavedModelBundle saved_model_bundle;
+  SignatureDef signature_def;
+
+  TensorInfo& in = (*signature_def.mutable_inputs())["input_arg"];
+  in.mutable_coo_sparse()->set_values_tensor_name("input1:0");
+  in.mutable_coo_sparse()->set_indices_tensor_name("input2:0");
+  in.mutable_coo_sparse()->set_dense_shape_tensor_name("input3:0");
+
+  TensorInfo& out = (*signature_def.mutable_outputs())["output_arg"];
+  out.mutable_coo_sparse()->set_values_tensor_name("output1:0");
+  out.mutable_coo_sparse()->set_indices_tensor_name("output2:0");
+  out.mutable_coo_sparse()->set_dense_shape_tensor_name("output3:0");
+
+  AddSignatureDefToSavedModelBundle(signature_def, "signature_def",
+                                    &saved_model_bundle);
+  GraphDef frozen_graph_def;
+  std::unordered_set<string> inputs;
+  std::unordered_set<string> outputs;
+  TF_ASSERT_OK(FreezeSavedModel(saved_model_bundle, &frozen_graph_def, &inputs,
+                                &outputs));
+  std::unordered_set<string> expected_inputs = {"input1:0", "input2:0",
+                                                "input3:0"};
+  std::unordered_set<string> expected_outputs = {"output1:0", "output2:0",
+                                                 "output3:0"};
+  EXPECT_EQ(expected_inputs, inputs);
+  EXPECT_EQ(expected_outputs, outputs);
 }
 
 }  // namespace

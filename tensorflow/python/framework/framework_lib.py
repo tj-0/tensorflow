@@ -14,59 +14,7 @@
 # ==============================================================================
 
 # pylint: disable=unused-import,g-bad-import-order
-"""Classes and functions for building TensorFlow graphs.
-
-## Core graph data structures
-
-@@Graph
-@@Operation
-@@Tensor
-
-## Tensor types
-
-@@DType
-@@as_dtype
-
-## Utility functions
-
-@@device
-@@container
-@@name_scope
-@@colocate_with
-@@control_dependencies
-@@convert_to_tensor
-@@convert_to_tensor_or_indexed_slices
-@@convert_to_tensor_or_sparse_tensor
-@@get_default_graph
-@@reset_default_graph
-@@import_graph_def
-@@load_file_system_library
-@@load_op_library
-@@make_tensor_proto
-@@make_ndarray
-
-## Graph collections
-
-@@add_to_collection
-@@add_to_collections
-@@get_collection
-@@get_collection_ref
-@@GraphKeys
-
-## Defining new operations
-
-@@RegisterGradient
-@@NotDifferentiable
-@@NoGradient
-@@TensorShape
-@@Dimension
-@@op_scope
-@@get_seed
-
-## For libraries building on TensorFlow
-
-@@register_tensor_conversion_function
-"""
+"""Classes and functions for building TensorFlow graphs."""
 
 from __future__ import absolute_import
 from __future__ import division
@@ -111,7 +59,6 @@ from tensorflow.python.framework.tensor_util import MakeNdarray as make_ndarray
 from tensorflow.python.framework.ops import RegisterGradient
 from tensorflow.python.framework.ops import NotDifferentiable
 from tensorflow.python.framework.ops import NoGradient
-from tensorflow.python.framework.ops import RegisterShape
 from tensorflow.python.framework.tensor_shape import Dimension
 from tensorflow.python.framework.tensor_shape import TensorShape
 

@@ -45,7 +45,7 @@ class ClusterTest(test.TestCase):
       op_perfs, run_time, step_stats = grappler_cluster.MeasureCosts(
           grappler_item)
       self.assertTrue(run_time > 0)
-      self.assertEqual(len(op_perfs), 8)
+      self.assertEqual(len(op_perfs), 4)
       self.assertTrue(step_stats.dev_stats)
 
   def testNoDetailedStats(self):
@@ -81,15 +81,16 @@ class ClusterTest(test.TestCase):
         self.assertLessEqual(1, len(peak_mem))
         snapshot = peak_mem['/job:localhost/replica:0/task:0/device:CPU:0']
         peak_usage = snapshot[0]
-        self.assertEqual(52, peak_usage)
+        self.assertEqual(12, peak_usage)
         live_tensors = snapshot[1]
-        self.assertEqual(15, len(live_tensors))
+        self.assertEqual(5, len(live_tensors))
 
   def testVirtualCluster(self):
     with ops.Graph().as_default() as g:
-      a = random_ops.random_uniform(shape=())
-      b = random_ops.random_uniform(shape=())
-      c = a + b
+      with ops.device('/device:GPU:0'):
+        a = random_ops.random_uniform(shape=[1024, 1024])
+        b = random_ops.random_uniform(shape=[1024, 1024])
+        c = a + b
       train_op = ops.get_collection_ref(ops.GraphKeys.TRAIN_OP)
       train_op.append(c)
       mg = meta_graph.create_meta_graph_def(graph=g)
@@ -98,15 +99,16 @@ class ClusterTest(test.TestCase):
           type='GPU',
           frequency=1000,
           num_cores=60,
-          environment={
-              'architecture': '7'
-          })
+          environment={'architecture': '7'})
       named_device = device_properties_pb2.NamedDevice(
-          properties=device_properties, name='/GPU:0')
-      grappler_cluster = cluster.Cluster(devices=[named_device])
+          properties=device_properties, name='/device:GPU:0')
+      grappler_cluster = cluster.Cluster(
+          disable_detailed_stats=False,
+          disable_timeline=False,
+          devices=[named_device])
       op_perfs, run_time, _ = grappler_cluster.MeasureCosts(grappler_item)
-      self.assertGreater(run_time, 0)
-      self.assertEqual(len(op_perfs), 15)
+      self.assertEqual(run_time, 0.000209)
+      self.assertEqual(len(op_perfs), 5)
 
       estimated_perf = grappler_cluster.EstimatePerformance(named_device)
       self.assertEqual(7680.0, estimated_perf)
@@ -125,7 +127,7 @@ class ClusterTest(test.TestCase):
         disable_detailed_stats=False, disable_timeline=False) as gcluster:
       op_perfs, run_time, step_stats = gcluster.MeasureCosts(grappler_item)
       self.assertTrue(run_time > 0)
-      self.assertEqual(len(op_perfs), 8)
+      self.assertEqual(len(op_perfs), 4)
       self.assertTrue(step_stats.dev_stats)
 
   def testAvailableOps(self):

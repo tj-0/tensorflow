@@ -49,6 +49,9 @@ class HadoopFileSystem : public FileSystem {
 
   Status GetChildren(const string& dir, std::vector<string>* result) override;
 
+  Status GetMatchingPaths(const string& pattern,
+                          std::vector<string>* results) override;
+
   Status DeleteFile(const string& fname) override;
 
   Status CreateDir(const string& name) override;
@@ -65,8 +68,9 @@ class HadoopFileSystem : public FileSystem {
 
  private:
   Status Connect(StringPiece fname, hdfsFS* fs);
-  LibHDFS* hdfs_;
 };
+
+Status SplitArchiveNameAndPath(StringPiece& path, string& nn);
 
 }  // namespace tensorflow
 

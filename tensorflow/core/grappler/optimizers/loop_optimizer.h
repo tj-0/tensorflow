@@ -17,6 +17,7 @@ limitations under the License.
 #define TENSORFLOW_CORE_GRAPPLER_OPTIMIZERS_LOOP_OPTIMIZER_H_
 
 #include <unordered_set>
+
 #include "tensorflow/core/grappler/costs/graph_properties.h"
 #include "tensorflow/core/grappler/optimizers/graph_optimizer.h"
 #include "tensorflow/core/grappler/utils.h"
@@ -30,12 +31,16 @@ constexpr char kLoopOptimizer[] = "LoopOptimizer";
 
 class LoopOptimizer : public GraphOptimizer {
  public:
-  LoopOptimizer() : opt_level_(RewriterConfig::ON) {}
-  explicit LoopOptimizer(RewriterConfig::Toggle opt_level)
-      : opt_level_(opt_level) {}
+  LoopOptimizer();
+
+  explicit LoopOptimizer(RewriterConfig::Toggle opt_level,
+                         DeviceBase* cpu_device);
+
   ~LoopOptimizer() override {}
 
   string name() const override { return "loop_optimizer"; };
+
+  bool UsesFunctionLibrary() const override { return false; }
 
   Status Optimize(Cluster* cluster, const GrapplerItem& item,
                   GraphDef* optimized_graph) override;
@@ -44,29 +49,29 @@ class LoopOptimizer : public GraphOptimizer {
                 const GraphDef& optimized_graph, double result) override;
 
  private:
-  Status LoopInvariantNodeMotion();
-  Status FindInvariantNodes(NodeDef* node);
-  Status RevertInvariantNodes();
-  Status MoveInvariantNodes(const int frame_id);
-  Status LINMHandleInvariantNode(NodeDef* node, const int num_outputs,
-      const int frame_id);
-  Status LINMHandleConst(NodeDef* node, const int num_outputs,
-      const int frame_id);
-  Status LINMHandleInvariantEnter(NodeDef* node, const int num_outputs);
+  friend class LoopOptimizerTest;
 
-  std::map<NodeDef*, int> invariant_nodes_;
-  std::set<int> empty_set_;
-  std::map<int, std::set<int>> frame_children_;
-  std::map<int, int> frame_parent_;
-  std::map<int, const NodeDef*> loop_cond_;
-  std::map<int, std::vector<NodeDef*>> invariant_enters_;
-  int new_enter_id_;
+  // Granular control for loop optimizer stages.
+  struct LoopOptimizerOptions {
+    bool enable_loop_invariant_node_motion = false;
+    bool enable_stack_push_removal = true;
+    bool enable_dead_branch_removal = true;
+
+    static LoopOptimizerOptions Default(RewriterConfig::Toggle opt_level) {
+      LoopOptimizerOptions options;
+      return options;
+    }
+  };
+
+  Status RemoveDeadBranches(const std::unordered_set<string>& nodes_to_preserve,
+                            const NodeMap& node_map,
+                            const absl::flat_hash_set<string>& feed_nodes,
+                            GraphDef* optimized_graph);
+
   RewriterConfig::Toggle opt_level_;
-
-  std::unique_ptr<NodeMap> node_map_;
-  FrameMap frame_map_;
-  std::unique_ptr<GraphProperties> graph_properties_;
-  GraphDef* optimized_graph_;  // Not owned.
+  DeviceBase* cpu_device_;
+  LoopOptimizerOptions options_;
+  std::unique_ptr<ResourceMgr> resource_mgr_;
 };
 
 }  // end namespace grappler

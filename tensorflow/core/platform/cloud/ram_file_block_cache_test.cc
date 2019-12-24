@@ -14,9 +14,11 @@ limitations under the License.
 ==============================================================================*/
 
 #include "tensorflow/core/platform/cloud/ram_file_block_cache.h"
+
 #include <cstring>
-#include "tensorflow/core/lib/core/blocking_counter.h"
+
 #include "tensorflow/core/lib/core/status_test_util.h"
+#include "tensorflow/core/platform/blocking_counter.h"
 #include "tensorflow/core/platform/cloud/now_seconds_env.h"
 #include "tensorflow/core/platform/env.h"
 #include "tensorflow/core/platform/notification.h"
@@ -37,6 +39,52 @@ Status ReadCache(RamFileBlockCache* cache, const string& filename,
   return status;
 }
 
+TEST(RamFileBlockCacheTest, IsCacheEnabled) {
+  auto fetcher = [](const string& filename, size_t offset, size_t n,
+                    char* buffer, size_t* bytes_transferred) {
+    // Do nothing.
+    return Status::OK();
+  };
+  RamFileBlockCache cache1(0, 0, 0, fetcher);
+  RamFileBlockCache cache2(16, 0, 0, fetcher);
+  RamFileBlockCache cache3(0, 32, 0, fetcher);
+  RamFileBlockCache cache4(16, 32, 0, fetcher);
+
+  EXPECT_FALSE(cache1.IsCacheEnabled());
+  EXPECT_FALSE(cache2.IsCacheEnabled());
+  EXPECT_FALSE(cache3.IsCacheEnabled());
+  EXPECT_TRUE(cache4.IsCacheEnabled());
+}
+
+TEST(RamFileBlockCacheTest, ValidateAndUpdateFileSignature) {
+  int calls = 0;
+  auto fetcher = [&calls](const string& filename, size_t offset, size_t n,
+                          char* buffer, size_t* bytes_transferred) {
+    calls++;
+    memset(buffer, 'x', n);
+    *bytes_transferred = n;
+    return Status::OK();
+  };
+  string filename = "file";
+  RamFileBlockCache cache(16, 32, 0, fetcher);
+  std::vector<char> out;
+
+  // First read.
+  EXPECT_TRUE(cache.ValidateAndUpdateFileSignature(filename, 123));
+  TF_EXPECT_OK(ReadCache(&cache, filename, 0, 16, &out));
+  EXPECT_EQ(calls, 1);
+
+  // Second read. Hit cache.
+  EXPECT_TRUE(cache.ValidateAndUpdateFileSignature(filename, 123));
+  TF_EXPECT_OK(ReadCache(&cache, filename, 0, 16, &out));
+  EXPECT_EQ(calls, 1);
+
+  // Third read. File signatures are different.
+  EXPECT_FALSE(cache.ValidateAndUpdateFileSignature(filename, 321));
+  TF_EXPECT_OK(ReadCache(&cache, filename, 0, 16, &out));
+  EXPECT_EQ(calls, 2);
+}
+
 TEST(RamFileBlockCacheTest, PassThrough) {
   const string want_filename = "foo/bar";
   const size_t want_offset = 42;
@@ -53,10 +101,12 @@ TEST(RamFileBlockCacheTest, PassThrough) {
     *bytes_transferred = got_n;
     return Status::OK();
   };
-  // If block_size, max_bytes, or both are zero, the cache is a pass-through.
+  // If block_size, max_bytes, or both are zero, or want_n is larger than
+  // max_bytes the cache is a pass-through.
   RamFileBlockCache cache1(1, 0, 0, fetcher);
   RamFileBlockCache cache2(0, 1, 0, fetcher);
   RamFileBlockCache cache3(0, 0, 0, fetcher);
+  RamFileBlockCache cache4(1000, 1000, 0, fetcher);
   std::vector<char> out;
   TF_EXPECT_OK(ReadCache(&cache1, want_filename, want_offset, want_n, &out));
   EXPECT_EQ(calls, 1);
@@ -64,6 +114,8 @@ TEST(RamFileBlockCacheTest, PassThrough) {
   EXPECT_EQ(calls, 2);
   TF_EXPECT_OK(ReadCache(&cache3, want_filename, want_offset, want_n, &out));
   EXPECT_EQ(calls, 3);
+  TF_EXPECT_OK(ReadCache(&cache4, want_filename, want_offset, want_n, &out));
+  EXPECT_EQ(calls, 4);
 }
 
 TEST(RamFileBlockCacheTest, BlockAlignment) {
@@ -487,8 +539,7 @@ TEST(RamFileBlockCacheTest, CoalesceConcurrentReads) {
         TF_EXPECT_OK(ReadCache(&cache, "", 0, block_size / 2, &out));
         EXPECT_EQ(out.size(), block_size / 2);
       }));
-  EXPECT_TRUE(WaitForNotificationWithTimeout(&notification, 10000))
-      << "Timeout waiting for concurrent thread to start.";
+  notification.WaitForNotification();
   std::vector<char> out;
   TF_EXPECT_OK(ReadCache(&cache, "", block_size / 2, block_size / 2, &out));
   EXPECT_EQ(out.size(), block_size / 2);

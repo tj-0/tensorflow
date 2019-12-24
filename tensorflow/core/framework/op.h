@@ -13,8 +13,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#ifndef TENSORFLOW_FRAMEWORK_OP_H_
-#define TENSORFLOW_FRAMEWORK_OP_H_
+#ifndef TENSORFLOW_CORE_FRAMEWORK_OP_H_
+#define TENSORFLOW_CORE_FRAMEWORK_OP_H_
 
 #include <functional>
 #include <unordered_map>
@@ -73,6 +73,9 @@ class OpRegistry : public OpRegistryInterface {
 
   Status LookUp(const string& op_type_name,
                 const OpRegistrationData** op_reg_data) const override;
+
+  // Returns OpRegistrationData* of registered op type, else returns nullptr.
+  const OpRegistrationData* LookUp(const string& op_type_name) const;
 
   // Fills *ops with all registered OpDefs (except those with names
   // starting with '_' if include_internal == false) sorted in
@@ -144,6 +147,8 @@ class OpRegistry : public OpRegistryInterface {
   Status RegisterAlreadyLocked(const OpRegistrationDataFactory& op_data_factory)
       const EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
+  const OpRegistrationData* LookUpSlow(const string& op_type_name) const;
+
   mutable mutex mu_;
   // Functions in deferred_ may only be called with mu_ held.
   mutable std::vector<OpRegistrationDataFactory> deferred_ GUARDED_BY(mu_);
@@ -164,10 +169,13 @@ class OpRegistry : public OpRegistryInterface {
 class OpListOpRegistry : public OpRegistryInterface {
  public:
   // Does not take ownership of op_list, *op_list must outlive *this.
-  OpListOpRegistry(const OpList* op_list);
+  explicit OpListOpRegistry(const OpList* op_list);
   ~OpListOpRegistry() override;
   Status LookUp(const string& op_type_name,
                 const OpRegistrationData** op_reg_data) const override;
+
+  // Returns OpRegistrationData* of op type in list, else returns nullptr.
+  const OpRegistrationData* LookUp(const string& op_type_name) const;
 
  private:
   // Values are owned.
@@ -208,17 +216,17 @@ class OpDefBuilderWrapper;
 template <>
 class OpDefBuilderWrapper<true> {
  public:
-  OpDefBuilderWrapper(const char name[]) : builder_(name) {}
-  OpDefBuilderWrapper<true>& Attr(StringPiece spec) {
-    builder_.Attr(spec);
+  explicit OpDefBuilderWrapper(const char name[]) : builder_(name) {}
+  OpDefBuilderWrapper<true>& Attr(string spec) {
+    builder_.Attr(std::move(spec));
     return *this;
   }
-  OpDefBuilderWrapper<true>& Input(StringPiece spec) {
-    builder_.Input(spec);
+  OpDefBuilderWrapper<true>& Input(string spec) {
+    builder_.Input(std::move(spec));
     return *this;
   }
-  OpDefBuilderWrapper<true>& Output(StringPiece spec) {
-    builder_.Output(spec);
+  OpDefBuilderWrapper<true>& Output(string spec) {
+    builder_.Output(std::move(spec));
     return *this;
   }
   OpDefBuilderWrapper<true>& SetIsCommutative() {
@@ -237,12 +245,12 @@ class OpDefBuilderWrapper<true> {
     builder_.SetAllowsUninitializedInput();
     return *this;
   }
-  OpDefBuilderWrapper<true>& Deprecated(int version, StringPiece explanation) {
-    builder_.Deprecated(version, explanation);
+  OpDefBuilderWrapper<true>& Deprecated(int version, string explanation) {
+    builder_.Deprecated(version, std::move(explanation));
     return *this;
   }
-  OpDefBuilderWrapper<true>& Doc(StringPiece text) {
-    builder_.Doc(text);
+  OpDefBuilderWrapper<true>& Doc(string text) {
+    builder_.Doc(std::move(text));
     return *this;
   }
   OpDefBuilderWrapper<true>& SetShapeFn(
@@ -260,7 +268,7 @@ class OpDefBuilderWrapper<true> {
 template <>
 class OpDefBuilderWrapper<false> {
  public:
-  constexpr OpDefBuilderWrapper(const char name[]) {}
+  explicit constexpr OpDefBuilderWrapper(const char name[]) {}
   OpDefBuilderWrapper<false>& Attr(StringPiece spec) { return *this; }
   OpDefBuilderWrapper<false>& Input(StringPiece spec) { return *this; }
   OpDefBuilderWrapper<false>& Output(StringPiece spec) { return *this; }
@@ -309,4 +317,4 @@ struct OpDefBuilderReceiver {
 
 }  // namespace tensorflow
 
-#endif  // TENSORFLOW_FRAMEWORK_OP_H_
+#endif  // TENSORFLOW_CORE_FRAMEWORK_OP_H_

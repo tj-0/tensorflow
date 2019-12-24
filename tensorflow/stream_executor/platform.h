@@ -21,6 +21,7 @@ limitations under the License.
 
 #include <map>
 
+#include "tensorflow/stream_executor/device_description.h"
 #include "tensorflow/stream_executor/device_options.h"
 #include "tensorflow/stream_executor/lib/status.h"
 #include "tensorflow/stream_executor/lib/status_macros.h"
@@ -29,10 +30,10 @@ limitations under the License.
 #include "tensorflow/stream_executor/plugin.h"
 #include "tensorflow/stream_executor/trace_listener.h"
 
-namespace perftools {
-namespace gputools {
+namespace stream_executor {
 
 class StreamExecutor;
+class DeviceDescription;
 
 // Describes the platform for a StreamExecutor instantiation to act upon.
 //
@@ -41,6 +42,7 @@ class StreamExecutor;
 enum class PlatformKind {
   kInvalid,
   kCuda,
+  kROCm,
   kOpenCL,
   kHost,
   kMock,
@@ -106,7 +108,7 @@ class Platform {
   namespace {                           \
   int plugin_id_value;                  \
   }                                     \
-  const perftools::gputools::Platform::Id ID_VAR_NAME = &plugin_id_value;
+  const ::stream_executor::Platform::Id ID_VAR_NAME = &plugin_id_value;
 
   // Returns a key uniquely identifying this platform.
   virtual Id id() const = 0;
@@ -132,6 +134,15 @@ class Platform {
   // InitializePlatformWithId/InitializePlatformWithName.
   virtual port::Status Initialize(
       const std::map<string, string>& platform_options);
+
+  // Returns a populated DeviceDescription for the device at the given ordinal.
+  // This should not require device initialization. Note that not all platforms
+  // may support acquiring the DeviceDescription indirectly.
+  //
+  // Alternatively callers may call GetDeviceDescription() on the StreamExecutor
+  // which returns a cached instance specific to the initialized StreamExecutor.
+  virtual port::StatusOr<std::unique_ptr<DeviceDescription>>
+  DescriptionForDevice(int ordinal) const = 0;
 
   // Returns a device with the given ordinal on this platform with a default
   // plugin configuration or, if none can be found with the given ordinal or
@@ -205,7 +216,6 @@ class Platform {
   SE_DISALLOW_COPY_AND_ASSIGN(Platform);
 };
 
-}  // namespace gputools
-}  // namespace perftools
+}  // namespace stream_executor
 
 #endif  // TENSORFLOW_STREAM_EXECUTOR_PLATFORM_H_
